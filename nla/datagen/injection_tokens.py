@@ -33,10 +33,13 @@ _CacheEntry = dict[str, Any]
 
 _CACHE_PATH = Path(__file__).parent / "injection_token_cache.yaml"
 
-# CJK Enclosed Letters and Months / CJK Compatibility blocks.
+# CJK Enclosed Letters and Months, CJK Compatibility, and CJK Unified Ideographs.
 # ㊗ (U+3297 "circled ideograph congratulation") lives here. These are
 # single-codepoint, virtually absent from English text.
-_INJECTION_RANGE = (0x3200, 0x33FF)
+# Extended to U+9FFF because some tokenizers (e.g. Qwen2/tiktoken-BPE) merge all
+# chars in U+3200–U+33FF with adjacent `>` / `<` via BPE — we scan further to find
+# a char whose UTF-8 first byte doesn't participate in those merge rules.
+_INJECTION_RANGE = (0x3200, 0x9FFF)
 
 
 def _load_cache() -> dict[str, _CacheEntry]:
@@ -54,8 +57,17 @@ def _tokenize_one(tokenizer: Any, text: str) -> list[int]:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
 
 
-def find_injection_token(tokenizer: Any) -> tuple[str, int]:
-    """Auto-pick a single-token CJK char for activation injection. Cached."""
+def find_injection_token(
+    tokenizer: Any,
+    actor_template: str | None = None,
+) -> tuple[str, int]:
+    """Auto-pick a single-token CJK char for activation injection. Cached.
+
+    actor_template: if provided, also verify the char appears exactly once
+    when the template is tokenized via apply_chat_template — catches BPE
+    merges that absorb the char in context even though it's single-token
+    in isolation (e.g. `>㈎` merging into one token for some tokenizers).
+    """
     key = tokenizer.name_or_path
     cache = _load_cache()
 
@@ -71,11 +83,24 @@ def find_injection_token(tokenizer: Any) -> tuple[str, int]:
         )
         return cached_char, cached_id
 
+    def _valid_in_context(char: str, token_id: int) -> bool:
+        if actor_template is None:
+            return True
+        content = actor_template.format(injection_char=char)
+        raw = tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        # transformers 5.x returns BatchFeature instead of list[int].
+        ids = raw if isinstance(raw, list) else list(raw["input_ids"])
+        return sum(1 for tid in ids if tid == token_id) == 1
+
     lo, hi = _INJECTION_RANGE
     for codepoint in range(lo, hi + 1):
         char = chr(codepoint)
         ids = _tokenize_one(tokenizer, char)
-        if len(ids) == 1:
+        if len(ids) == 1 and _valid_in_context(char, ids[0]):
             cache[key] = {"char": char, "token_id": ids[0]}
             _save_cache(cache)
             return char, ids[0]
@@ -130,7 +155,7 @@ def build_token_meta(
     Neighbor computation delegates to nla.schema.compute_canonical_neighbors —
     same function training-side verification uses.
     """
-    inj_char, inj_id = find_injection_token(tokenizer)
+    inj_char, inj_id = find_injection_token(tokenizer, actor_template=actor_template)
     left_id, right_id = compute_canonical_neighbors(tokenizer, actor_template, inj_char, inj_id)
 
     suffix_ids = compute_critic_suffix_ids(tokenizer, critic_template) if critic_template else None
