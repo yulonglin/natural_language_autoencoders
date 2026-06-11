@@ -31,6 +31,12 @@ EXPLANATION_RE = re.compile(
     re.DOTALL,
 )
 
+# Reasoning models (DeepSeek-R1 family, Qwen3) may emit a <think>…</think>
+# block before the payload even when SFT targets suppress it. Strip a leading
+# think block before searching so a stray "<explanation>" mentioned inside the
+# reasoning isn't mistaken for the payload.
+_LEADING_THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+
 
 def wrap_explanation(text: str) -> str:
     """Wrap text in explanation tags for the AV-SFT response column.
@@ -49,7 +55,7 @@ def extract_explanation(response: str) -> str | None:
     Without this, RL queries the critic with <text>\nfoo\n</text> but AR-SFT
     trained it on <text>foo</text> — different tokens.
     """
-    m = EXPLANATION_RE.search(response)
+    m = EXPLANATION_RE.search(_LEADING_THINK_RE.sub("", response, count=1))
     return m.group(1).strip() if m else None
 
 

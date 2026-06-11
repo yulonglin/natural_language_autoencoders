@@ -65,6 +65,35 @@ MODELS: dict[str, ModelPreset] = {
         turn_marker="<start_of_turn>",
         accepts_system_role=False,
     ),
+    "r1_distill_1.5b": ModelPreset(
+        hf_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        num_layers=28,
+        d_model=1536,
+        extractor_kwargs={"batch_size": 32, "max_length": 4096},
+        # R1-Distill replaces the Qwen chat template with DeepSeek's:
+        # <|begin_of_sentence|>{system}<|User|>{prompt}<|Assistant|> — no
+        # single shared turn marker; user turns start with <|User|>.
+        # (Verified against tokenizer.chat_template on the Modal timing run.)
+        turn_marker="<｜User｜>",
+        accepts_system_role=True,
+    ),
+    # Backcompat alias used by the first Modal wrapper drafts.
+    "r1distill1.5b": ModelPreset(
+        hf_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        num_layers=28,
+        d_model=1536,
+        extractor_kwargs={"batch_size": 32, "max_length": 4096},
+        turn_marker="<｜User｜>",
+        accepts_system_role=True,
+    ),
+    "qwen3_1.7b": ModelPreset(
+        hf_name="Qwen/Qwen3-1.7B",
+        num_layers=28,
+        d_model=2048,
+        extractor_kwargs={"batch_size": 32, "max_length": 4096},
+        turn_marker="<|im_start|>",
+        accepts_system_role=True,
+    ),
     "llama70b": ModelPreset(
         hf_name="meta-llama/Llama-3.3-70B-Instruct",
         num_layers=80,

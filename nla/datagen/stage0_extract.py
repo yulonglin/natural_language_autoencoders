@@ -79,6 +79,13 @@ def main() -> None:
     p.add_argument("--base-model", required=True, help="HF model name/path — also keys the extractor if not overridden")
     p.add_argument("--corpus", required=True, help="HF dataset name, e.g. HuggingFaceFW/fineweb")
     p.add_argument("--corpus-config", default=None, help="HF dataset config name")
+    p.add_argument("--corpus-data-files", nargs="+", default=None,
+                   help="explicit parquet shard URL(s)/path(s) (e.g. hf://datasets/openbmb/"
+                        "Ultra-FineWeb/data/ultrafineweb_en/ultrafineweb-en-part-0001-of-2048.parquet). "
+                        "Loads via the 'parquet' builder — avoids the full HF repo-tree walk that "
+                        "times out on multi-thousand-shard datasets. --corpus still names the "
+                        "dataset for doc_id/sidecar provenance; --corpus-split is the logical "
+                        "split name for doc_ids (the parquet builder always exposes 'train').")
     p.add_argument("--corpus-split", default="train")
     p.add_argument("--corpus-start", type=int, default=0)
     p.add_argument("--corpus-length", type=int, required=True, help="number of documents to process")
@@ -117,7 +124,12 @@ def main() -> None:
         and tokenizer.pad_token_id != tokenizer.eos_token_id
     ) else None
 
-    ds = load_dataset(args.corpus, name=args.corpus_config, split=args.corpus_split)
+    if args.corpus_data_files:
+        # Explicit shards: the parquet builder downloads only the listed files
+        # and exposes a single 'train' split regardless of --corpus-split.
+        ds = load_dataset("parquet", data_files=args.corpus_data_files, split="train")
+    else:
+        ds = load_dataset(args.corpus, name=args.corpus_config, split=args.corpus_split)
     assert isinstance(ds, Dataset), (
         f"expected a concrete Dataset, got {type(ds).__name__}. "
         f"Pass an explicit split (e.g. --corpus-split train), not a streaming/dict dataset."

@@ -71,6 +71,9 @@ def _stage0(cfg: dict[str, Any], p: dict[str, str]) -> None:
     ]
     if cfg["corpus"].get("config"):
         common += ["--corpus-config", cfg["corpus"]["config"]]
+    if cfg["corpus"].get("data_files"):
+        files = cfg["corpus"]["data_files"]
+        common += ["--corpus-data-files", *([files] if isinstance(files, str) else files)]
     if s0.get("extractor_kwargs"):
         common += ["--extractor-kwargs", json.dumps(s0["extractor_kwargs"])]
 
