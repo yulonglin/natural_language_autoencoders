@@ -657,10 +657,29 @@ class NLAFSDPActor(FSDPTrainRayActor):
             out = self.model(**model_args)
             batch["_nla_backbone_last_hidden"] = out.backbone_last_hidden.detach().squeeze(0)
             values = out.values.float()
+            # NLA_CRITIC_DEBUG: localize the multi-GPU MSE NaN (ISSUES-LOG O1/O3).
+            # Prints per-rank finiteness/absmax for forward (h, values), the
+            # loss->values backward grad, the loss, and post-backward param grads
+            # at step 0-2. Gated + step-bounded → inert on production runs.
+            _dbg = bool(os.environ.get("NLA_CRITIC_DEBUG")) and step_id < 3
+            if _dbg:
+                self._nla_debug_forward(step_id, out, values)
             loss, _, log_dict = loss_function(
                 self.args, self.parallel_state, batch, num_microbatches, values,
             )
-            loss.backward()
+            if _dbg:
+                self._nla_debug_loss(step_id, loss)
+            # NLA_DETECT_ANOMALY: localize the op whose backward first produces a
+            # non-finite grad. set_detect_anomaly is expensive, so gate it behind
+            # its own flag + the same step_id<3 bound and crash (after logging the
+            # autograd RuntimeError + forward-op traceback) so we capture the signal.
+            _anomaly = bool(os.environ.get("NLA_DETECT_ANOMALY")) and step_id < 3
+            if _anomaly:
+                self._nla_anomaly_backward(step_id, loss)
+            else:
+                loss.backward()
+            if _dbg:
+                self._nla_debug_grads(step_id)
             return log_dict
         log_dict = super()._train_step(batch, step_id, num_microbatches)
         # FSDP2 overlaps this microbatch's reduce-scatter with the next
@@ -677,6 +696,77 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # recompute; this is the boundary between microbatches).
         torch.cuda.synchronize()
         return log_dict
+
+    # --- NLA multi-GPU NaN diagnostics (env-gated; see _train_step) ----------
+    @staticmethod
+    def _nla_rank():
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def _nla_debug_forward(self, step_id, out, values):
+        rank = self._nla_rank()
+
+        def stat(name, t):
+            tf = t.detach().float()
+            print(f"[NLADBG r{rank} s{step_id}] {name} "
+                  f"finite={bool(torch.isfinite(tf).all())} "
+                  f"absmax={tf.abs().max().item():.4e} shape={tuple(t.shape)}",
+                  flush=True)
+
+        stat("h", out.backbone_last_hidden)
+        stat("values", out.values)
+
+        def _hook(g):
+            gf = g.detach().float()
+            print(f"[NLADBG r{rank} s{step_id}] dL/dvalues "
+                  f"finite={bool(torch.isfinite(gf).all())} "
+                  f"absmax={gf.abs().max().item():.4e}", flush=True)
+
+        values.register_hook(_hook)
+
+    def _nla_debug_loss(self, step_id, loss):
+        rank = self._nla_rank()
+        lf = loss.detach().float()
+        print(f"[NLADBG r{rank} s{step_id}] loss={lf.item():.6e} "
+              f"finite={bool(torch.isfinite(lf).all())}", flush=True)
+
+    def _nla_debug_grads(self, step_id):
+        rank = self._nla_rank()
+        n_nonfinite = 0
+        worst = 0.0
+        for nm, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            gl = g.to_local() if isinstance(g, DTensor) else g
+            glf = gl.detach().float()
+            finite = bool(torch.isfinite(glf).all())
+            m = glf.abs().max().item()
+            if not finite:
+                n_nonfinite += 1
+            if finite and m > worst:
+                worst = m
+            if "value_head" in nm:
+                print(f"[NLADBG r{rank} s{step_id}] grad[{nm}] "
+                      f"finite={finite} absmax={m:.4e}", flush=True)
+        print(f"[NLADBG r{rank} s{step_id}] grads: "
+              f"n_nonfinite_params={n_nonfinite} finite_absmax={worst:.4e}",
+              flush=True)
+
+    def _nla_anomaly_backward(self, step_id, loss):
+        # set_detect_anomaly raises a RuntimeError naming the forward op whose
+        # backward produced the first non-finite grad, plus a second traceback at
+        # the forward call site. Log both (greppable prefix) then re-raise so the
+        # run crashes — the crash IS the signal we want.
+        import traceback
+        rank = self._nla_rank()
+        try:
+            with torch.autograd.set_detect_anomaly(True, check_nan=True):
+                loss.backward()
+        except RuntimeError as e:
+            print(f"[NLA_ANOMALY r{rank} s{step_id}] {e}", flush=True)
+            print(f"[NLA_ANOMALY r{rank} s{step_id}] traceback:\n"
+                  f"{traceback.format_exc()}", flush=True)
+            raise
 
     def critic_fwd(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Inference-only forward, returns values at each sample's last real token.
