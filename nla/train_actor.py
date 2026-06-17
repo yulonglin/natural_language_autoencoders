@@ -654,7 +654,15 @@ class NLAFSDPActor(FSDPTrainRayActor):
     def _train_step(self, batch, step_id, num_microbatches):
         if self._is_critic_model:
             model_args = self._get_model_inputs_args(batch)
+            # NLA_FWD_HOOKS: localize the bf16 forward NaN (ISSUES-LOG O1/O3).
+            # Registers forward hooks on every submodule; reports the first module
+            # whose output goes non-finite while its input was finite — i.e. the op
+            # that births the NaN. Gated + step-bounded → inert on production runs.
+            _fwdhook = bool(os.environ.get("NLA_FWD_HOOKS")) and step_id < 3
+            _fwd_handles = self._nla_register_fwd_hooks(step_id) if _fwdhook else None
             out = self.model(**model_args)
+            if _fwdhook:
+                self._nla_report_fwd_hooks(step_id, _fwd_handles)
             batch["_nla_backbone_last_hidden"] = out.backbone_last_hidden.detach().squeeze(0)
             values = out.values.float()
             # NLA_CRITIC_DEBUG: localize the multi-GPU MSE NaN (ISSUES-LOG O1/O3).
@@ -751,6 +759,78 @@ class NLAFSDPActor(FSDPTrainRayActor):
         print(f"[NLADBG r{rank} s{step_id}] grads: "
               f"n_nonfinite_params={n_nonfinite} finite_absmax={worst:.4e}",
               flush=True)
+
+    @staticmethod
+    def _nla_finite_absmax(obj):
+        """Reduce any tensor / nested tuple|list|dict of tensors to
+        (all_finite, absmax) over floating-point tensors only."""
+        finite, absmax = True, 0.0
+
+        def visit(x):
+            nonlocal finite, absmax
+            if isinstance(x, torch.Tensor) and x.is_floating_point():
+                xf = x.detach().float()
+                finite = finite and bool(torch.isfinite(xf).all())
+                if xf.numel():
+                    absmax = max(absmax, xf.abs().max().item())
+            elif isinstance(x, (tuple, list)):
+                for y in x:
+                    visit(y)
+            elif isinstance(x, dict):
+                for y in x.values():
+                    visit(y)
+
+        visit(obj)
+        return finite, absmax
+
+    def _nla_register_fwd_hooks(self, step_id):
+        """Register forward hooks on ALL submodules (not just leaves: hooks fire
+        in execution order, children before parents, so a container op like SDPA
+        inside self_attn is correctly identified when its leaf q/k/v projections
+        were finite). Records every module emitting non-finite output. Returns
+        handles; caller removes them after the forward."""
+        records = []  # appended in forward-execution order
+
+        def make_hook(name, mod):
+            def hook(_m, inp, out):
+                out_finite, out_absmax = self._nla_finite_absmax(out)
+                if not out_finite:
+                    in_finite, in_absmax = self._nla_finite_absmax(inp)
+                    records.append((name, type(mod).__name__,
+                                    in_finite, in_absmax, out_absmax))
+            return hook
+
+        handles = [mod.register_forward_hook(make_hook(name, mod))
+                   for name, mod in self.model.named_modules()]
+        self._nla_fwd_records = records
+        return handles
+
+    def _nla_report_fwd_hooks(self, step_id, handles):
+        for h in handles:
+            h.remove()
+        rank = self._nla_rank()
+        records = self._nla_fwd_records
+        if not records:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] all module outputs finite",
+                  flush=True)
+            return
+        # Culprit = first module (execution order) with finite input, nonfinite
+        # output. Everything after it is just NaN propagating downstream.
+        culprit = next((r for r in records if r[2]), None)
+        if culprit is not None:
+            name, typ, in_finite, in_absmax, out_absmax = culprit
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] CULPRIT {name} ({typ}) "
+                  f"in_finite={in_finite} in_absmax={in_absmax:.4e} "
+                  f"out_absmax={out_absmax:.4e}", flush=True)
+        else:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] no finite-in/nonfinite-out "
+                  f"transition found (NaN may enter via inputs)", flush=True)
+        print(f"[NLA_FWDHOOK r{rank} s{step_id}] {len(records)} modules emitted "
+              f"non-finite output; first 6 in execution order:", flush=True)
+        for name, typ, in_finite, in_absmax, out_absmax in records[:6]:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}]   {name} ({typ}) "
+                  f"in_finite={in_finite} in_absmax={in_absmax:.4e} "
+                  f"out_absmax={out_absmax:.4e}", flush=True)
 
     def _nla_anomaly_backward(self, step_id, loss):
         # set_detect_anomaly raises a RuntimeError naming the forward op whose
