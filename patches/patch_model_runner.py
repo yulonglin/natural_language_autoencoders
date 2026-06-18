@@ -4,27 +4,17 @@
 Root cause (two-layer problem):
 
 Layer 1 — CUDA_VISIBLE_DEVICES not set before scheduler spawn:
-  Miles uses launch_server_process (HTTP server mode, subprocess.Popen) rather
-  than SGLang's Engine class (mp.Process). SGLang's maybe_reindex_device_id
-  only wraps mp.Process.start(), so without the common.py patch it never runs.
   Fix: patch_sglang_device_reindex.py (patches common.py, applied earlier).
 
 Layer 2 — CUDA runtime poisoned by import-time probes (THIS PATCH):
-  Even with CUDA_VISIBLE_DEVICES correctly set to a single GPU, the scheduler
-  subprocess's Python import chain (sgl-kernel, flashinfer) probes CUDA during
-  import via torch.cuda.is_available() → cudaGetDeviceCount(). On Modal A100
-  nodes in CUDA forward-compat mode, cudaGetDeviceCount() fails with Error 803
-  and leaves the CUDA runtime in a sticky broken state. All subsequent runtime
-  API calls (including the set_device() below) then inherit the 803 error.
+  Even with CUDA_VISIBLE_DEVICES correctly set to a single GPU, forward-compat
+  CUDA on Modal A100 nodes causes cudaGetDeviceCount() to fail with Error 803.
 
-Fix: before set_device(), call cuInit(0) via the CUDA driver API (libcuda.so).
-  The driver API bypasses the forward-compat version check and initializes the
-  CUDA driver. Then call cudaGetLastError() to clear any sticky 803 from prior
-  import-time probes. With the driver properly initialized, the subsequent
-  runtime API call set_device(0) → _cuda_init() → cudaGetDeviceCount() succeeds.
-
-Also: fall back to setting CUDA_VISIBLE_DEVICES here if common.py patch wasn't
-applied (defensive — common.py patch should handle this, but belt-and-suspenders).
+Fix: before set_device(), call cuInit(0) via the real CUDA driver API (libcuda.so.1,
+  NOT the stub libcuda.so) to initialize the driver context. Then call
+  cudaGetLastError() to clear any sticky 803 from prior import probes.
+  With the driver context properly initialized, the subsequent runtime API call
+  set_device(0) → _cuda_init() → cudaGetDeviceCount() should succeed.
 """
 import sys
 from pathlib import Path
@@ -42,10 +32,10 @@ if not f.exists():
 
 code = f.read_text()
 TARGET = "torch.get_device_module(self.device).set_device(self.gpu_id)"
-GUARD = "cuInit(0)  # driver API: init before runtime calls"
+GUARD = "modal_cuda_803_fix_v3"
 
 if GUARD in code:
-    print("model_runner.py already patched")
+    print("model_runner.py already patched (v3)")
     sys.exit(0)
 
 if TARGET not in code:
@@ -57,25 +47,35 @@ line_start = code.rfind("\n", 0, idx) + 1
 indent = code[line_start:idx]
 
 insert = (
-    indent + "# Modal CUDA Error 803 fix (layer 2): init driver API before any runtime call.\n"
-    + indent + "# Forward-compat CUDA on Modal: cudaGetDeviceCount() in import-time probes\n"
-    + indent + "# (sgl-kernel, flashinfer) leaves the runtime in a sticky 803 state.\n"
-    + indent + "# cuInit(0) via libcuda.so initialises the driver without a version check;\n"
-    + indent + "# cudaGetLastError() clears the sticky 803 so set_device() can succeed.\n"
-    + indent + "import ctypes as _ctypes, os as _os\n"
-    + indent + "try:\n"
-    + indent + "    _ctypes.CDLL('libcuda.so').cuInit(0)  # driver API: init before runtime calls\n"
-    + indent + "except Exception:\n"
-    + indent + "    pass\n"
-    + indent + "try:\n"
-    + indent + "    for _lib in ('libcudart.so.12', 'libcudart.so'):\n"
-    + indent + "        try:\n"
-    + indent + "            _ctypes.CDLL(_lib).cudaGetLastError()  # clear sticky 803\n"
-    + indent + "            break\n"
-    + indent + "        except OSError:\n"
-    + indent + "            pass\n"
-    + indent + "except Exception:\n"
-    + indent + "    pass\n"
+    indent + "# modal_cuda_803_fix_v3: init real CUDA driver before any runtime call.\n"
+    + indent + "# libcuda.so may be a stub on Modal; try libcuda.so.1 (actual versioned driver).\n"
+    + indent + "# cuInit(0) via the real driver initialises the CUDA driver context without\n"
+    + indent + "# the forward-compat version check that cudaGetDeviceCount() performs.\n"
+    + indent + "# cudaGetLastError() clears any sticky 803 from prior import-time probes.\n"
+    + indent + "import ctypes as _ctypes, ctypes.util as _ctypes_util, os as _os\n"
+    + indent + "_cu_init_ret = None\n"
+    + indent + "for _libname in ('libcuda.so.1', 'libcuda.so', _ctypes_util.find_library('cuda')):\n"
+    + indent + "    if not _libname:\n"
+    + indent + "        continue\n"
+    + indent + "    try:\n"
+    + indent + "        _libcuda = _ctypes.CDLL(_libname)\n"
+    + indent + "        _libcuda.cuInit.restype = _ctypes.c_int\n"
+    + indent + "        _cu_init_ret = _libcuda.cuInit(0)\n"
+    + indent + "        print(f'[modal_803_fix] cuInit(0) via {_libname} returned {_cu_init_ret}')\n"
+    + indent + "        break\n"
+    + indent + "    except OSError as _e:\n"
+    + indent + "        print(f'[modal_803_fix] {_libname} not found: {_e}')\n"
+    + indent + "        continue\n"
+    + indent + "for _rtlib in ('libcudart.so.12', 'libcudart.so'):\n"
+    + indent + "    try:\n"
+    + indent + "        _rt = _ctypes.CDLL(_rtlib)\n"
+    + indent + "        _rt.cudaGetLastError.restype = _ctypes.c_int\n"
+    + indent + "        _rt_err = _rt.cudaGetLastError()\n"
+    + indent + "        print(f'[modal_803_fix] cudaGetLastError via {_rtlib} returned {_rt_err}')\n"
+    + indent + "        break\n"
+    + indent + "    except OSError:\n"
+    + indent + "        continue\n"
+    + indent + "print(f'[modal_803_fix] about to set_device({self.gpu_id}) CUDA_VISIBLE_DEVICES={_os.environ.get(\"CUDA_VISIBLE_DEVICES\")!r}')\n"
     + indent + "# Layer 1 fallback: set CUDA_VISIBLE_DEVICES if common.py patch didn't run.\n"
     + indent + "if _os.environ.get('CUDA_VISIBLE_DEVICES') is None and self.gpu_id >= 0:\n"
     + indent + "    _os.environ['CUDA_VISIBLE_DEVICES'] = str(self.gpu_id)\n"
@@ -83,4 +83,4 @@ insert = (
 )
 
 f.write_text(code[:line_start] + insert + code[line_start:])
-print("patched model_runner.py: cuInit(0) + cudaGetLastError() before set_device()")
+print("patched model_runner.py: cuInit(libcuda.so.1) + cudaGetLastError() + debug output")
