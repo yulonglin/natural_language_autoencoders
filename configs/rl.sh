@@ -93,7 +93,7 @@ ${PYTHON:-python} train.py \
     --prompt-data "$RL_PARQUET" \
     --input-key prompt \
     --hf-checkpoint "$INSTRUCT_MODEL" \
-    --ref-load "$ACTOR_SFT_CKPT" \
+    --ref-load "${ACTOR_SFT_CKPT}/hf" \
     --load "$ACTOR_SFT_CKPT" \
     --nla-sidecar-source "$ACTOR_SFT_CKPT" \
     --save "$RUN_DIR/actor" \
