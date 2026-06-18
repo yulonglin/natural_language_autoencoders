@@ -44,5 +44,5 @@ insert = (
     + indent + "    pass\n"
 )
 
-f.write_text(code[:idx] + insert + code[idx:])
+f.write_text(code[:line_start] + insert + code[line_start:])
 print("patched model_runner.py: inserted cuInit(0) before set_device()")
