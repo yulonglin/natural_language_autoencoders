@@ -112,6 +112,12 @@ ${PYTHON:-python} train.py \
     `# share the same marker token → silent wrong output. DO NOT REMOVE to "optimize".` \
     --sglang-disable-radix-cache \
     --sglang-context-length 300 \
+    `# Pre-set device='cuda' so ServerArgs.__post_init__ never calls get_device()` \
+    `# in the SGLangEngine Ray actor, which has CUDA Error 803 (NCCL/FSDP-poisoned` \
+    `# context). launch_server_process already uses spawn so the subprocess gets a` \
+    `# fresh CUDA context and initialises fine. This bypasses the root cause;` \
+    `# the mitigation CUDA_MODULE_LOADING=LAZY (rl_probe.py image .env) is kept.` \
+    --sglang-device cuda \
     --router-history-backend none \
     `# cache_aware (default) builds prefix tree storing request bodies — with NLA` \
     `# input_embeds (~6-12MB each) that IS the leak. round_robin: no tree.` \
