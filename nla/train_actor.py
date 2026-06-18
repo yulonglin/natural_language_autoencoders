@@ -10,11 +10,17 @@ early-returns when log_probs/values are None, _train_step override handles .valu
 Override _train_core (not train) so parent handles get_rollout_data + timers + perf log.
 """
 
+import multiprocessing
 import os
 import threading
 import shutil
 import subprocess
 import sys
+
+# Force spawn so SGLang's server subprocess gets a clean CUDA context.
+# fork-after-CUDA-init (the training ranks touch CUDA before the rollout
+# server forks) causes CUDA Error 803 in the child.
+multiprocessing.set_start_method("spawn", force=True)
 
 import ray
 
