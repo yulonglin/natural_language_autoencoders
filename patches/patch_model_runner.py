@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Patch SGLang model_runner.py: diagnostic print at init_torch_distributed.
+"""Patch SGLang model_runner.py: broad libcuda search + clear sticky 803.
 
-v5 — DIAGNOSTIC ONLY (LD_LIBRARY_PATH fix moved upstream to sitecustomize + scheduler)
-========================================================================================
+v6 — BROAD SEARCH + cudaGetLastError() to clear inherited sticky 803
+======================================================================
 
-With sitecustomize v3 + scheduler v5 fixing LD_LIBRARY_PATH upstream, by the time we
-reach init_torch_distributed(), the host driver's libcuda.so.1 should already be loaded
-and cuInit = 0. This patch only prints confirmation.
+Root cause chain (confirmed from smoke #13, 2026-06-19):
+  1. SGLangEngine Ray actor imports torch.cuda → compat libcuda loads → cuInit=803
+     (sticky error set in libcudart's per-thread error variable)
+  2. Fork → HTTP server → fork → scheduler subprocess
+  3. scheduler (sched_v7/v8) finds real libcuda in /usr/lib/x86_64-linux-gnu/,
+     cuInit(0)=0 via driver API, bypasses torch.cuda fork guards, calls
+     cudaGetLastError() to clear the inherited sticky 803
+  4. Fork → model_runner subprocess (inherits scheduler's cleared state)
+  5. model_runner.py v5 tried /usr/local/nvidia/lib64/libcuda.so.1 → NOT FOUND
+     → OSError printed, then set_device hit residual 803 → RuntimeError → crash
 
-If something still fails here (set_device raises 803), the prints tell us exactly what
-LD_LIBRARY_PATH and CUDA_VISIBLE_DEVICES the scheduler process has at that point.
-
-NEVER load /usr/local/cuda/compat/libcuda.so.1 here — that would poison the linker.
+v6 fix:
+  - Search /usr/lib/x86_64-linux-gnu/ FIRST (that's where libcuda.so.580.95.05 is)
+  - Load it via ctypes (confirms real driver in SONAME cache for libcudart)
+  - Call cudaGetLastError() on libcudart to clear any residual 803 from parent forks
+  - THEN allow set_device(gpu_id) to proceed
 """
 import sys
 from pathlib import Path
@@ -29,14 +37,15 @@ if not f.exists():
 
 code = f.read_text()
 TARGET = "torch.get_device_module(self.device).set_device(self.gpu_id)"
-GUARD = "modal_cuda_803_fix_v5"
+GUARD = "modal_cuda_803_fix_v6"
 
 if GUARD in code:
-    print("model_runner.py already patched (v5)")
+    print("model_runner.py already patched (v6)")
     sys.exit(0)
 
-# Remove any older version of this patch before inserting v5.
+# Strip older versions.
 for old_guard in (
+    "modal_cuda_803_fix_v5",
     "modal_cuda_803_fix_v4",
     "modal_cuda_803_fix_v3",
     "modal_cuda_803_fix_v2",
@@ -67,24 +76,49 @@ line_start = code.rfind("\n", 0, idx) + 1
 indent = code[line_start:idx]
 
 insert = (
-    indent + f"# {GUARD}: diagnostic print at init_torch_distributed.\n"
-    + indent + "import os as _os, ctypes as _ctypes\n"
-    + indent + "print(f'[modal_v5 pid={_os.getpid()}]"
-    " LD_LIBRARY_PATH={_os.environ.get(\"LD_LIBRARY_PATH\")!r}', flush=True)\n"
-    + indent + "print(f'[modal_v5 pid={_os.getpid()}]"
-    " CUDA_VISIBLE_DEVICES={_os.environ.get(\"CUDA_VISIBLE_DEVICES\")!r}"
+    indent + f"# {GUARD}: broad libcuda search + clear sticky 803 before set_device\n"
+    + indent + "import os as _mr_os, ctypes as _mr_ct, glob as _mr_gl\n"
+    + indent + "print(f'[modal_v6 pid={_mr_os.getpid()}]"
+    " LD={_mr_os.environ.get(\"LD_LIBRARY_PATH\")!r}"
+    " CVD={_mr_os.environ.get(\"CUDA_VISIBLE_DEVICES\")!r}"
     " gpu_id={self.gpu_id}', flush=True)\n"
-    # Call cuInit on host driver to confirm it's registered and returns 0.
-    + indent + "_host_libcuda = '/usr/local/nvidia/lib64/libcuda.so.1'\n"
+    # Broad search — /usr/lib/x86_64-linux-gnu/ confirmed from smoke13
+    + indent + "_mr_COMPAT = '/usr/local/cuda/compat'\n"
+    + indent + "_mr_PATHS = [\n"
+    + indent + "    '/usr/lib/x86_64-linux-gnu', '/usr/local/nvidia/lib64',\n"
+    + indent + "    '/usr/local/nvidia/lib', '/usr/lib64', '/usr/lib', '/usr/local/lib',\n"
+    + indent + "] + [p for p in _mr_os.environ.get('LD_LIBRARY_PATH', '').split(':')\n"
+    + indent + "     if p and p != _mr_COMPAT]\n"
+    + indent + "_mr_libcuda = None\n"
+    + indent + "for _mr_sp in _mr_PATHS:\n"
+    + indent + "    _mr_cands = [\n"
+    + indent + "        fn for fn in sorted(_mr_gl.glob(_mr_sp + '/libcuda.so*'))\n"
+    + indent + "        if _mr_os.path.isfile(fn) and _mr_COMPAT not in fn\n"
+    + indent + "    ]\n"
+    + indent + "    if _mr_cands:\n"
+    + indent + "        _mr_libcuda = _mr_cands[-1]\n"
+    + indent + "        break\n"
+    + indent + "if _mr_libcuda:\n"
+    + indent + "    try:\n"
+    + indent + "        _mr_drv = _mr_ct.CDLL(_mr_libcuda)\n"
+    + indent + "        _mr_drv.cuInit.restype = _mr_ct.c_int\n"
+    + indent + "        _mr_ret = _mr_drv.cuInit(0)\n"
+    + indent + "        print(f'[modal_v6] cuInit(0) via {_mr_libcuda} = {_mr_ret}', flush=True)\n"
+    + indent + "    except OSError as _mr_e:\n"
+    + indent + "        print(f'[modal_v6] CDLL failed: {_mr_e}', flush=True)\n"
+    + indent + "else:\n"
+    + indent + "    print('[modal_v6] no host libcuda found in any path', flush=True)\n"
+    # Clear sticky 803 from parent (SGLangEngine actor inherited by scheduler, then model_runner)
     + indent + "try:\n"
-    + indent + "    _libcuda = _ctypes.CDLL(_host_libcuda)\n"
-    + indent + "    _libcuda.cuInit.restype = _ctypes.c_int\n"
-    + indent + "    _cu_ret = _libcuda.cuInit(0)\n"
-    + indent + "    print(f'[modal_v5] cuInit(0) via host driver = {_cu_ret}', flush=True)\n"
-    + indent + "except OSError as _e:\n"
-    + indent + "    print(f'[modal_v5] host driver not found: {_e}', flush=True)\n"
-    + indent + "del _os, _ctypes, _host_libcuda\n"
+    + indent + "    _mr_rt = _mr_ct.CDLL('libcudart.so.12')\n"
+    + indent + "    _mr_rt.cudaGetLastError.restype = _mr_ct.c_int\n"
+    + indent + "    _mr_sticky = _mr_rt.cudaGetLastError()\n"
+    + indent + "    print(f'[modal_v6] cudaGetLastError() cleared: {_mr_sticky}', flush=True)\n"
+    + indent + "except Exception as _mr_ce:\n"
+    + indent + "    print(f'[modal_v6] cudaGetLastError failed: {_mr_ce}', flush=True)\n"
+    + indent + "print(f'[modal_v6] calling set_device({self.gpu_id})', flush=True)\n"
+    + indent + "del _mr_os, _mr_ct, _mr_gl, _mr_COMPAT, _mr_PATHS, _mr_libcuda\n"
 )
 
 f.write_text(code[:line_start] + insert + code[line_start:])
-print("patched model_runner.py (v5): diagnostic print at init_torch_distributed")
+print("patched model_runner.py (v6): broad libcuda search + cudaGetLastError before set_device")

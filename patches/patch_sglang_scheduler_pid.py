@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """Patch SGLang scheduler.py to fix LD_LIBRARY_PATH and bypass PyTorch fork CUDA guards.
 
-v6 — GLOB-BASED LIBCUDA DISCOVERY (mirrors sitecustomize v4)
-=============================================================
+v8 — ADD cudaGetLastError() TO CLEAR PARENT'S STICKY 803
+=========================================================
 
-Root cause (confirmed 2026-06-19, run ber9wcskc):
-  /usr/local/nvidia/lib64/libcuda.so.1 does NOT EXIST on Modal GPU workers.
-  Modal's NVIDIA container toolkit mounts only the versioned file (e.g.,
-  libcuda.so.560.28.03). v5 tried to load libcuda.so.1 directly → failed →
-  glibc fell back to /etc/ld.so.cache which had the compat library cached →
-  cuInit=803 → libcudart sticky error → set_device crashes.
+Key finding from smoke #13 (2026-06-19):
+  Host libcuda is at /usr/lib/x86_64-linux-gnu/libcuda.so.580.95.05
+  (NOT at /usr/local/nvidia/lib64 — that directory is empty on Modal GPU workers).
 
-v6 fix (belt-and-suspenders over sitecustomize v4 + LD_PRELOAD):
-  sitecustomize v4 runs first (at Python startup in the scheduler subprocess),
-  loading the versioned libcuda and setting LD_PRELOAD. This should fix 803
-  before run_scheduler_process() is even called. This patch is kept as a safety
-  net in case sitecustomize didn't run (e.g., pre-forked Ray worker pool).
+  sched_v7 successfully:
+    [sched_v7] found host libcuda in '/usr/lib/x86_64-linux-gnu'
+    [sched_v7] cuInit(0) via .../libcuda.so.580.95.05 = 0  ← SUCCESS
+    [sched_v7] bypassed torch.cuda fork guards
 
-  At the TOP of run_scheduler_process():
-  1. Fix LD_LIBRARY_PATH (remove compat, put nvidia/lib64 first).
-  2. Glob for /usr/local/nvidia/lib64/libcuda.so.* to find the versioned file.
-  3. Load it via ctypes.CDLL — registers it as canonical 'libcuda.so.1' in the
-     process-wide SONAME cache.
-  4. Set LD_PRELOAD for further child processes.
-  5. Bypass PyTorch fork-CUDA guards as belt-and-suspenders.
+  But model_runner still crashed:
+    [modal_v5] host driver not found: /usr/local/nvidia/lib64/libcuda.so.1 ← wrong path
+    Traceback: RuntimeError from set_device (sticky 803 still in libcudart)
+
+v8 additions:
+  After successful cuInit(0)=0, call cudaGetLastError() on libcudart to clear
+  the sticky 803 error that was inherited from the SGLangEngine parent actor
+  (which got 803 when it imported torch.cuda without a valid driver context).
+  This clears the per-thread error variable in libcudart BEFORE the scheduler
+  spawns model_runner subprocesses, so those forks inherit a clean state.
 """
 
 import sys
@@ -31,8 +30,9 @@ from pathlib import Path
 
 TARGET_FILE = (sys.argv[1] if len(sys.argv) > 1
                else "/root/sglang/python/sglang/srt/managers/scheduler.py")
-GUARD = "modal_fork_bad_fork_v7"
+GUARD = "modal_fork_bad_fork_v8"
 OLD_GUARDS = [
+    "modal_fork_bad_fork_v7",
     "modal_fork_bad_fork_v6",
     "modal_fork_bad_fork_v5",
     "modal_fork_bad_fork_v4",
@@ -90,26 +90,27 @@ while pos < len(code) and code[pos] != '\n':
     pos += 1
 pos += 1  # skip the newline — now at first char of function body
 
-# The RESET block: broad libcuda search + LD_LIBRARY_PATH fix + fork guards.
-# v7: DON'T import torch.cuda here — it triggers the sticky 803 error before we
-# can do anything. Instead access it via sys.modules ONLY if already loaded.
-# Also broadened the search beyond nvidia/lib64 to match sitecustomize v5.
+# The RESET block: broad libcuda search + LD_LIBRARY_PATH fix + clear sticky 803 + fork guards.
+# v8: After cuInit(0)=0, call cudaGetLastError() on libcudart to clear the sticky 803
+# that was inherited from the SGLangEngine actor (which got 803 when importing torch.cuda).
+# This is needed so that model_runner subprocesses (forked from the scheduler) inherit
+# a clean libcudart state, allowing torch.cuda.set_device() to succeed.
 RESET = (
-    f"    # {GUARD}: fix LD_LIBRARY_PATH + broad host driver search.\n"
+    f"    # {GUARD}: fix LD_LIBRARY_PATH + broad host driver search + clear sticky 803.\n"
     "    import os as _os, ctypes as _ctypes, glob as _glob, sys as _sys\n"
     "    _compat_path = '/usr/local/cuda/compat'\n"
     "    _ld_orig = _os.environ.get('LD_LIBRARY_PATH', '')\n"
     "    _parts = [p for p in _ld_orig.split(':') if p and p != _compat_path]\n"
     "    _ld_fixed = ':'.join(_parts)\n"
     "    _os.environ['LD_LIBRARY_PATH'] = _ld_fixed\n"
-    "    print(f'[sched_v7 pid={_os.getpid()}]"
+    "    print(f'[sched_v8 pid={_os.getpid()}]"
     " LD_LIBRARY_PATH: {_ld_orig!r} -> {_ld_fixed!r}', flush=True)\n"
-    "    print(f'[sched_v7 pid={_os.getpid()}]"
+    "    print(f'[sched_v8 pid={_os.getpid()}]"
     " CUDA_VISIBLE_DEVICES={_os.environ.get(\"CUDA_VISIBLE_DEVICES\")!r}', flush=True)\n"
-    "    # Broad search: nvidia/lib64 may be empty on Modal; try many paths.\n"
+    "    # Broad search: /usr/lib/x86_64-linux-gnu confirmed from smoke13.\n"
     "    _SEARCH_PATHS = [\n"
-    "        '/usr/local/nvidia/lib64', '/usr/local/nvidia/lib',\n"
-    "        '/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib', '/usr/local/lib',\n"
+    "        '/usr/lib/x86_64-linux-gnu', '/usr/local/nvidia/lib64', '/usr/local/nvidia/lib',\n"
+    "        '/usr/lib64', '/usr/lib', '/usr/local/lib',\n"
     "    ] + [p for p in _parts if p]\n"
     "    _host_libcuda = None\n"
     "    for _sdir in _SEARCH_PATHS:\n"
@@ -117,44 +118,43 @@ RESET = (
     "        _real = [f for f in _cands if _os.path.isfile(f) and _compat_path not in f]\n"
     "        if _real:\n"
     "            _host_libcuda = _real[-1]\n"
-    "            print(f'[sched_v7] found host libcuda in {_sdir!r}: {_real}', flush=True)\n"
+    "            print(f'[sched_v8] found host libcuda in {_sdir!r}: {_real}', flush=True)\n"
     "            break\n"
     "    if not _host_libcuda:\n"
-    "        print(f'[sched_v7] no host libcuda found in any search path', flush=True)\n"
-    "        # Diagnostic: list /usr/local/nvidia/ recursively\n"
-    "        try:\n"
-    "            _nv_files = []\n"
-    "            for _r, _d, _fs in _os.walk('/usr/local/nvidia'):\n"
-    "                for _fn in _fs:\n"
-    "                    _nv_files.append(_os.path.join(_r, _fn))\n"
-    "                if len(_nv_files) > 30: break\n"
-    "            print(f'[sched_v7] /usr/local/nvidia files: {_nv_files[:30]}', flush=True)\n"
-    "        except Exception as _e:\n"
-    "            print(f'[sched_v7] walk /usr/local/nvidia failed: {_e}', flush=True)\n"
+    "        print(f'[sched_v8] no host libcuda found in any search path', flush=True)\n"
     "    if _host_libcuda:\n"
     "        try:\n"
     "            _lib = _ctypes.CDLL(_host_libcuda)\n"
     "            _lib.cuInit.restype = _ctypes.c_int\n"
     "            _ret = _lib.cuInit(0)\n"
-    "            print(f'[sched_v7] cuInit(0) via {_host_libcuda} = {_ret}', flush=True)\n"
+    "            print(f'[sched_v8] cuInit(0) via {_host_libcuda} = {_ret}', flush=True)\n"
     "            _preload = _os.environ.get('LD_PRELOAD', '')\n"
     "            if _host_libcuda not in _preload:\n"
     "                _os.environ['LD_PRELOAD'] = (_host_libcuda +"
     " (':' + _preload if _preload else ''))\n"
     "        except OSError as _e:\n"
-    "            print(f'[sched_v7] CDLL({_host_libcuda!r}) failed: {_e}', flush=True)\n"
+    "            print(f'[sched_v8] CDLL({_host_libcuda!r}) failed: {_e}', flush=True)\n"
+    "    # Clear sticky 803 inherited from SGLangEngine actor (got 803 at torch.cuda import).\n"
+    "    # cudaGetLastError() resets the per-thread error variable in libcudart.\n"
+    "    try:\n"
+    "        _cudart = _ctypes.CDLL('libcudart.so.12')\n"
+    "        _cudart.cudaGetLastError.restype = _ctypes.c_int\n"
+    "        _sticky = _cudart.cudaGetLastError()\n"
+    "        print(f'[sched_v8] cudaGetLastError() cleared sticky error: {_sticky}', flush=True)\n"
+    "    except Exception as _cue:\n"
+    "        print(f'[sched_v8] cudaGetLastError failed: {_cue}', flush=True)\n"
     "    # Only bypass torch.cuda fork-guard if torch.cuda is ALREADY in sys.modules.\n"
     "    # Do NOT import it here — that triggers the sticky 803 before libcuda is fixed.\n"
     "    _tc = _sys.modules.get('torch.cuda')\n"
     "    if _tc is not None:\n"
     "        _tc._is_in_bad_fork = lambda: False\n"
     "        _tc._initialized = True\n"
-    "        print(f'[sched_v7] bypassed torch.cuda fork guards', flush=True)\n"
+    "        print(f'[sched_v8] bypassed torch.cuda fork guards', flush=True)\n"
     "    else:\n"
-    "        print(f'[sched_v7] torch.cuda not yet imported; fork guards skipped', flush=True)\n"
+    "        print(f'[sched_v8] torch.cuda not yet imported; fork guards skipped', flush=True)\n"
     "    del _os, _ctypes, _glob, _sys, _compat_path, _ld_orig, _parts, _ld_fixed,"
     " _SEARCH_PATHS, _host_libcuda, _tc\n"
 )
 
 f.write_text(code[:pos] + RESET + code[pos:])
-print(f"[{GUARD}] patched {TARGET_FILE}: broad libcuda search + no torch.cuda import")
+print(f"[{GUARD}] patched {TARGET_FILE}: broad libcuda search + cudaGetLastError + no torch.cuda import")
