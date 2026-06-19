@@ -16,10 +16,13 @@ subprocesses via a C-level check:
 Unlike the old _original_pid Python check, _cuda_isInBadFork is a C builtin that
 cannot be bypassed by resetting Python-level variables.
 
-Fix: monkey-patch torch.cuda._is_in_bad_fork = lambda: False at the very top of
-run_scheduler_process(). _lazy_init() reads _is_in_bad_fork from the module global
-namespace, so this replacement takes effect on the next _lazy_init() call.
-torch._C._cuda_init() then succeeds because cgroup GPU access is inherited via fork.
+Fix (two layers):
+  1. torch.cuda._is_in_bad_fork = lambda: False  — bypasses the Python guard in _lazy_init.
+  2. torch.cuda._initialized = True              — makes _lazy_init() return early so
+     torch._C._cuda_init() (which also has a C++ TORCH_INTERNAL_ASSERT(!is_device_in_bad_fork)
+     inside Module.cpp) is NEVER called. CUDA is then lazily initialized at the C++ ATen
+     level by the first cudaSetDevice() call, which has NO bad-fork check and succeeds
+     because GPU access is inherited via Modal's fork() (cgroup/FD membership is preserved).
 """
 
 import sys
@@ -27,7 +30,7 @@ from pathlib import Path
 
 TARGET_FILE = (sys.argv[1] if len(sys.argv) > 1
                else "/root/sglang/python/sglang/srt/managers/scheduler.py")
-GUARD = "modal_fork_bad_fork_v2"
+GUARD = "modal_fork_bad_fork_v3"
 
 f = Path(TARGET_FILE)
 if not f.exists():
@@ -62,10 +65,17 @@ while pos < len(code) and code[pos] != '\n':
 pos += 1  # skip the newline — now at first char of function body
 
 RESET = (
-    f"    # {GUARD}: bypass PyTorch's C-level fork guard; GPU access is inherited via cgroup\n"
+    f"    # {GUARD}: bypass ALL of PyTorch's fork CUDA guards.\n"
+    "    # Layer 1: _is_in_bad_fork lambda stops the Python-level check in _lazy_init.\n"
+    "    # Layer 2: _initialized=True makes _lazy_init() return early, never calling\n"
+    "    #   torch._C._cuda_init() which has a C++ TORCH_INTERNAL_ASSERT(!is_device_in_bad_fork).\n"
+    "    # CUDA is then lazily initialized at the C++ ATen level by the first cudaSetDevice()\n"
+    "    # call (no bad-fork check there), which succeeds because GPU access is inherited\n"
+    "    # via fork() in Modal's container (cgroup/FD membership is preserved by fork).\n"
     "    import torch.cuda as _torch_cuda\n"
     "    _torch_cuda._is_in_bad_fork = lambda: False\n"
+    "    _torch_cuda._initialized = True\n"
 )
 
 f.write_text(code[:pos] + RESET + code[pos:])
-print(f"[{GUARD}] patched {TARGET_FILE}: monkey-patched _is_in_bad_fork in run_scheduler_process")
+print(f"[{GUARD}] patched {TARGET_FILE}: bypassed all fork CUDA guards in run_scheduler_process")
