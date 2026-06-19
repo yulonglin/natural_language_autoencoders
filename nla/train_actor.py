@@ -507,7 +507,26 @@ class NLAFSDPActor(FSDPTrainRayActor):
         before rollout starts, this is the moment to dump a fresh copy.
         nla_generate._maybe_reload_embed reads it.
         """
-        super().update_weights()
+        # Fix NCCL mesh_dp SeqNum deadlock in Miles' UpdateWeight.update_weights():
+        # All 4 actor ranks submit async all-gathers (redistribute(async_op=True))
+        # for each bucket, then call update_bucket_weights(). Only rank 0 actually
+        # sends to SGLang; ranks 1-3 return immediately, race ahead, and submit the
+        # next bucket's all-gathers before rank 0 has submitted them. NCCL detects
+        # the SeqNum mismatch and fires the 600s watchdog. Fix: barrier after each
+        # bucket flush so all 4 ranks advance to the next bucket together.
+        from miles.backends.fsdp_utils.update_weight_utils import UpdateWeight
+
+        _orig_wait_and_update = UpdateWeight.wait_and_update_bucket_weights
+
+        def _synced_wait_and_update(wu_self, bucket):
+            _orig_wait_and_update(wu_self, bucket)
+            dist.barrier()
+
+        UpdateWeight.wait_and_update_bucket_weights = _synced_wait_and_update
+        try:
+            super().update_weights()
+        finally:
+            UpdateWeight.wait_and_update_bucket_weights = _orig_wait_and_update
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).
