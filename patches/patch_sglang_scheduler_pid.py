@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Patch SGLang scheduler.py to reset torch.cuda._original_pid at process start.
+"""Patch SGLang scheduler.py to bypass PyTorch's C-level fork CUDA guard.
 
 Context: After the fork-chain fix (patch_launch_server_fork + patch_sglang_mp_fork),
-the scheduler subprocess is a FORKED child of the HTTP server, which is itself a
-forked child of the SGLangEngine Ray actor. The cgroup GPU device access IS inherited
-via fork — but PyTorch's _lazy_init() has a software guard:
+the scheduler subprocess is a FORKED child of the HTTP server. The cgroup GPU device
+access IS inherited via fork — but PyTorch's _lazy_init() blocks CUDA init in forked
+subprocesses via a C-level check:
 
-    if _original_pid is None:
-        _original_pid = os.getpid()      # first caller: sets it
-    elif _original_pid != os.getpid():   # forked child: mismatch → RuntimeError
-        raise RuntimeError(
-            "Cannot re-initialize CUDA in forked subprocess. ..."
-        )
+    # torch/cuda/__init__.py line ~52:
+    _is_in_bad_fork = getattr(torch._C, "_cuda_isInBadFork", lambda: False)
 
-The scheduler's _original_pid was set in the SGLangEngine Ray actor (the original
-process that imported torch.cuda) and inherited via fork. The scheduler's os.getpid()
-differs → RuntimeError, even though the scheduler genuinely HAS GPU access.
+    # in _lazy_init():
+    if _is_in_bad_fork():
+        raise RuntimeError("Cannot re-initialize CUDA in forked subprocess...")
 
-Fix: reset _original_pid = os.getpid() at the very top of run_scheduler_process(),
-before any CUDA call. _lazy_init() then sees a match and proceeds to torch._C._cuda_init(),
-which succeeds because the cgroup membership was inherited via the fork chain.
+Unlike the old _original_pid Python check, _cuda_isInBadFork is a C builtin that
+cannot be bypassed by resetting Python-level variables.
+
+Fix: monkey-patch torch.cuda._is_in_bad_fork = lambda: False at the very top of
+run_scheduler_process(). _lazy_init() reads _is_in_bad_fork from the module global
+namespace, so this replacement takes effect on the next _lazy_init() call.
+torch._C._cuda_init() then succeeds because cgroup GPU access is inherited via fork.
 """
 
 import sys
@@ -27,7 +27,7 @@ from pathlib import Path
 
 TARGET_FILE = (sys.argv[1] if len(sys.argv) > 1
                else "/root/sglang/python/sglang/srt/managers/scheduler.py")
-GUARD = "modal_fork_pid_reset_v1"
+GUARD = "modal_fork_bad_fork_v2"
 
 f = Path(TARGET_FILE)
 if not f.exists():
@@ -62,10 +62,10 @@ while pos < len(code) and code[pos] != '\n':
 pos += 1  # skip the newline — now at first char of function body
 
 RESET = (
-    f"    # {GUARD}: bypass PyTorch's fork-CUDA guard; GPU access is inherited via cgroup\n"
-    "    import os as _os, torch.cuda as _torch_cuda\n"
-    "    _torch_cuda._original_pid = _os.getpid()\n"
+    f"    # {GUARD}: bypass PyTorch's C-level fork guard; GPU access is inherited via cgroup\n"
+    "    import torch.cuda as _torch_cuda\n"
+    "    _torch_cuda._is_in_bad_fork = lambda: False\n"
 )
 
 f.write_text(code[:pos] + RESET + code[pos:])
-print(f"[{GUARD}] patched {TARGET_FILE}: inserted _original_pid reset in run_scheduler_process")
+print(f"[{GUARD}] patched {TARGET_FILE}: monkey-patched _is_in_bad_fork in run_scheduler_process")
