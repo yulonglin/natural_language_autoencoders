@@ -287,20 +287,26 @@ PY
 # ─── scheduler_update_weights_mixin.py: use gloo for miles group ──────────
 #
 # Root cause: NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice when
-# the SGLang scheduler subprocess (GPU 4/5) calls dist.init_process_group
-# for the miles weight-update group (world_size=3, first-ever NCCL comm on
-# those GPUs). The bundled static libcudart 12.9 calls cuLibraryLoadData to
-# JIT-load CUDA 12.9 PTX kernels → crash against the 12.8 driver.
-# Fix: intercept dist.init_process_group and redirect backend='nccl',
-# world_size=3 → backend='gloo'. Gloo handles CUDA tensors via CPU copies.
+# the SGLang scheduler subprocess creates the miles weight-update group
+# (world_size=3). The bundled static libcudart 12.9 calls cuLibraryLoadData
+# to JIT-load PTX kernels → crash against the 12.8 driver.
+#
+# Why v1 failed: miles/backends/fsdp_utils/update_weight_utils.py does
+#   from miles.utils.distributed_utils import init_process_group
+# at module level, caching the reference before our monkey-patch of
+# torch.distributed.init_process_group was visible at that call site.
+# v1 also accidentally redirected the SGLang ENGINE's own world_size=1 init.
+#
+# Fix (v2): install a sys.meta_path hook that patches miles modules at load
+# time so the cached reference is already our gloo-redirecting wrapper.
 
 _patch_miles_gloo () {
     local f="$1"
     python3 - "$f" <<'PY'
-import sys
+import sys, re
 from pathlib import Path
 
-GUARD = "miles_gloo_v1"
+GUARD = "miles_gloo_v2"
 f = Path(sys.argv[1])
 s = f.read_text()
 
@@ -308,22 +314,76 @@ if GUARD in s:
     print(f"  {f} already has {GUARD}, skipping")
     sys.exit(0)
 
+# Remove v1 block if present (was the previous attempt; v2 replaces it).
+s = re.sub(
+    r'\n# === NLA: miles weight-update group gloo patch \(miles_gloo_v1\) ===.*?'
+    r'# === end miles gloo patch \(miles_gloo_v1\) ===\n',
+    '\n',
+    s,
+    flags=re.DOTALL,
+)
+
 PATCH = """\
-# === NLA: miles weight-update group gloo patch (miles_gloo_v1) ===
-# Redirect the miles weight-update NCCL group from nccl to gloo.
-# NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
-# scheduler subprocess (first NCCL init on those GPUs hits cuLibraryLoadData
-# against CUDA 12.8 driver). Gloo handles CUDA tensors via CPU copies.
-import torch.distributed as _nla_miles_td
-_nla_miles_orig_ipg = _nla_miles_td.init_process_group
-def _nla_miles_gloo_ipg(backend=None, *args, **kwargs):
-    ws = kwargs.get('world_size', -1)
-    if str(backend) == 'nccl' and ws not in (-1, 0):
-        print(f'[sglang miles_gloo] nccl world_size={ws} -> gloo (CUDA 12.8/12.9 fix)', flush=True)
-        backend = 'gloo'
-    return _nla_miles_orig_ipg(backend, *args, **kwargs)
-_nla_miles_td.init_process_group = _nla_miles_gloo_ipg
-# === end miles gloo patch (miles_gloo_v1) ===
+# === NLA: miles weight-update group gloo patch (miles_gloo_v2) ===
+# NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice when the SGLang
+# scheduler subprocess creates the miles weight-update group (world_size=3).
+# miles/backends/fsdp_utils/update_weight_utils.py does:
+#   from miles.utils.distributed_utils import init_process_group
+# which caches a direct reference at import time, bypassing any runtime
+# monkey-patch of torch.distributed.init_process_group.
+# Fix: install a sys.meta_path hook that patches the miles module's
+# init_process_group attribute when it is first loaded, so the cached
+# reference is already our gloo-redirecting wrapper.
+import importlib.machinery
+import importlib.util
+import sys as _nla_sys
+
+def _nla_gloo_wrap(orig, name):
+    def _f(backend=None, *args, **kwargs):
+        if str(backend) == 'nccl':
+            print(f'[sglang miles_gloo_v2:{name}] nccl -> gloo (CUDA 12.8/12.9 fix)', flush=True)
+            backend = 'gloo'
+        return orig(backend, *args, **kwargs)
+    return _f
+
+_NLA_GLOO_TARGETS = frozenset({
+    'miles.utils.distributed_utils',
+    'miles.backends.fsdp_utils.update_weight_utils',
+})
+
+class _NLAGlooLoader:
+    def __init__(self, real_loader, modname):
+        self._real = real_loader
+        self._name = modname
+    def create_module(self, spec):
+        c = getattr(self._real, 'create_module', None)
+        return c(spec) if callable(c) else None
+    def exec_module(self, mod):
+        self._real.exec_module(mod)
+        if hasattr(mod, 'init_process_group'):
+            mod.init_process_group = _nla_gloo_wrap(mod.init_process_group, self._name)
+            print(f'[sglang miles_gloo_v2] patched {self._name}.init_process_group', flush=True)
+
+class _NLAGlooFinder:
+    def find_spec(self, fullname, path, target=None):
+        if fullname not in _NLA_GLOO_TARGETS or fullname in _nla_sys.modules:
+            return None
+        _nla_sys.meta_path.remove(self)
+        real = None
+        try:
+            real = importlib.util.find_spec(fullname)
+        except (ModuleNotFoundError, ValueError):
+            pass
+        finally:
+            _nla_sys.meta_path.insert(0, self)
+        if real is None or real.loader is None:
+            return None
+        return importlib.machinery.ModuleSpec(
+            fullname, _NLAGlooLoader(real.loader, fullname), origin=real.origin
+        )
+
+_nla_sys.meta_path.insert(0, _NLAGlooFinder())
+# === end miles gloo patch (miles_gloo_v2) ===
 """
 
 # from __future__ imports MUST come first; insert patch after them.
@@ -353,7 +413,7 @@ for i, line in enumerate(lines):
 
 patched = '\n'.join(lines[:insert_idx]) + '\n' + PATCH + '\n'.join(lines[insert_idx:])
 f.write_text(patched)
-print(f"  patched {f} (inserted after line {insert_idx})")
+print(f"  patched {f} (miles_gloo_v2 at line {insert_idx})")
 PY
 }
 
@@ -408,8 +468,8 @@ else
 fi
 
 if [ -f "$WEIGHTS_MIXIN" ]; then
-    if grep -q "miles_gloo_v1" "$WEIGHTS_MIXIN"; then
-        echo "  scheduler_update_weights_mixin.py already patched, skipping"
+    if grep -q "miles_gloo_v2" "$WEIGHTS_MIXIN"; then
+        echo "  scheduler_update_weights_mixin.py already has miles_gloo_v2, skipping"
     else
         _patch_miles_gloo "$WEIGHTS_MIXIN"
     fi
@@ -425,5 +485,5 @@ grep -q "np\.concatenate.*for e in input_embeds" "$SCHED"  && echo "  ok schedul
 grep -q "Upstream PR #14110" "$SCHED"                      && echo "  ok schedule_batch.py (retract)"
 grep -q "Slice to match chunked-prefill" "$SCHED"          && echo "  ok schedule_batch.py (chunked-prefill)"
 [ ! -f "$GEMMA3" ] || grep -q "NLA: input_embeds bypass" "$GEMMA3" && echo "  ok gemma3_mm.py"
-[ ! -f "$WEIGHTS_MIXIN" ] || grep -q "miles_gloo_v1" "$WEIGHTS_MIXIN" && echo "  ok scheduler_update_weights_mixin.py"
+[ ! -f "$WEIGHTS_MIXIN" ] || grep -q "miles_gloo_v2" "$WEIGHTS_MIXIN" && echo "  ok scheduler_update_weights_mixin.py"
 echo "=== done ==="
