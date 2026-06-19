@@ -310,22 +310,50 @@ if GUARD in s:
 
 PATCH = """\
 # === NLA: miles weight-update group gloo patch (miles_gloo_v1) ===
-# Redirect the miles weight-update group (world_size=3) from nccl to gloo.
+# Redirect the miles weight-update NCCL group from nccl to gloo.
 # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
-# scheduler subprocess (first NCCL init on GPU 4/5 hits cuLibraryLoadData
+# scheduler subprocess (first NCCL init on those GPUs hits cuLibraryLoadData
 # against CUDA 12.8 driver). Gloo handles CUDA tensors via CPU copies.
 import torch.distributed as _nla_miles_td
 _nla_miles_orig_ipg = _nla_miles_td.init_process_group
 def _nla_miles_gloo_ipg(backend=None, *args, **kwargs):
-    if str(backend) == 'nccl' and kwargs.get('world_size', 0) == 3:
-        print('[sglang miles_gloo] nccl world_size=3 -> gloo (CUDA 12.8/12.9 fix)', flush=True)
+    ws = kwargs.get('world_size', -1)
+    if str(backend) == 'nccl' and ws not in (-1, 0):
+        print(f'[sglang miles_gloo] nccl world_size={ws} -> gloo (CUDA 12.8/12.9 fix)', flush=True)
         backend = 'gloo'
     return _nla_miles_orig_ipg(backend, *args, **kwargs)
 _nla_miles_td.init_process_group = _nla_miles_gloo_ipg
 # === end miles gloo patch (miles_gloo_v1) ===
 """
-f.write_text(PATCH + s)
-print(f"  patched {f}")
+
+# from __future__ imports MUST come first; insert patch after them.
+lines = s.split('\n')
+insert_idx = 0
+in_docstring = False
+docstring_char = None
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if not stripped or stripped.startswith('#'):
+        insert_idx = i + 1
+        continue
+    if not in_docstring and (stripped.startswith('"""') or stripped.startswith("'''")):
+        docstring_char = stripped[:3]
+        in_docstring = stripped.count(docstring_char) < 2
+        insert_idx = i + 1
+        continue
+    if in_docstring:
+        if docstring_char in stripped:
+            in_docstring = False
+            insert_idx = i + 1
+        continue
+    if stripped.startswith('from __future__'):
+        insert_idx = i + 1
+        continue
+    break
+
+patched = '\n'.join(lines[:insert_idx]) + '\n' + PATCH + '\n'.join(lines[insert_idx:])
+f.write_text(patched)
+print(f"  patched {f} (inserted after line {insert_idx})")
 PY
 }
 

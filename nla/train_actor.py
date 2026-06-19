@@ -499,6 +499,40 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # nothing to sync.
         pass
 
+    def set_rollout_manager(self, rollout_manager):
+        # UpdateWeightFromDistributed.connect_rollout_engines() creates an NCCL
+        # group spanning actor rank 0 and the SGLang scheduler subprocesses.
+        # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
+        # side (first NCCL comm on GPU 4/5; cuLibraryLoadData fails against CUDA
+        # 12.8 driver). Fix: redirect all new NCCL PG creation to gloo during
+        # this scope. Safe: mesh_dp/critic PGs are fully set up before this call.
+        # SGLang side is also patched via apply_sglang_patches.sh.
+        _orig_td_ipg = dist.init_process_group
+        _patch_miles = False
+        _orig_miles_ipg = None
+        try:
+            import miles.utils.distributed_utils as _miles_du
+            _orig_miles_ipg = _miles_du.init_process_group
+            _patch_miles = True
+        except (ImportError, AttributeError):
+            pass
+
+        def _gloo_for_miles_pg(backend=None, *args, **kwargs):
+            if str(backend) == 'nccl':
+                print('[actor set_rollout_manager] nccl -> gloo (CUDA 12.8/12.9 fix)', flush=True)
+                backend = 'gloo'
+            return _orig_td_ipg(backend, *args, **kwargs)
+
+        dist.init_process_group = _gloo_for_miles_pg
+        if _patch_miles:
+            _miles_du.init_process_group = _gloo_for_miles_pg
+        try:
+            super().set_rollout_manager(rollout_manager)
+        finally:
+            dist.init_process_group = _orig_td_ipg
+            if _patch_miles:
+                _miles_du.init_process_group = _orig_miles_ipg
+
     def update_weights(self):
         """Sync actor weights to SGLang, then dump embedding for nla_generate.
 
@@ -523,25 +557,10 @@ class NLAFSDPActor(FSDPTrainRayActor):
             dist.barrier()
 
         UpdateWeight.wait_and_update_bucket_weights = _synced_wait_and_update
-        # Redirect miles weight-update group (world_size=3) from nccl → gloo.
-        # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice when the
-        # SGLang scheduler subprocess (GPU 4/5) initializes its first-ever NCCL
-        # comm for the miles group. Gloo handles CUDA tensors via CPU copies
-        # (PyTorch >=1.10) — correct for smoke; optimize later if needed.
-        _orig_init_pg = dist.init_process_group
-
-        def _gloo_for_miles(backend=None, *args, **kwargs):
-            if str(backend) == 'nccl' and kwargs.get('world_size', 0) == 3:
-                print('[actor] nccl world_size=3 -> gloo (CUDA 12.8/12.9 mismatch fix)', flush=True)
-                backend = 'gloo'
-            return _orig_init_pg(backend, *args, **kwargs)
-
-        dist.init_process_group = _gloo_for_miles
         try:
             super().update_weights()
         finally:
             UpdateWeight.wait_and_update_bucket_weights = _orig_wait_and_update
-            dist.init_process_group = _orig_init_pg
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).
