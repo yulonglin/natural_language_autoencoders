@@ -523,10 +523,25 @@ class NLAFSDPActor(FSDPTrainRayActor):
             dist.barrier()
 
         UpdateWeight.wait_and_update_bucket_weights = _synced_wait_and_update
+        # Redirect miles weight-update group (world_size=3) from nccl → gloo.
+        # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice when the
+        # SGLang scheduler subprocess (GPU 4/5) initializes its first-ever NCCL
+        # comm for the miles group. Gloo handles CUDA tensors via CPU copies
+        # (PyTorch >=1.10) — correct for smoke; optimize later if needed.
+        _orig_init_pg = dist.init_process_group
+
+        def _gloo_for_miles(backend=None, *args, **kwargs):
+            if str(backend) == 'nccl' and kwargs.get('world_size', 0) == 3:
+                print('[actor] nccl world_size=3 -> gloo (CUDA 12.8/12.9 mismatch fix)', flush=True)
+                backend = 'gloo'
+            return _orig_init_pg(backend, *args, **kwargs)
+
+        dist.init_process_group = _gloo_for_miles
         try:
             super().update_weights()
         finally:
             UpdateWeight.wait_and_update_bucket_weights = _orig_wait_and_update
+            dist.init_process_group = _orig_init_pg
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).

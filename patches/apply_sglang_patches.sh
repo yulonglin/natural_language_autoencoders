@@ -23,6 +23,7 @@ HTTP="$SGLANG_SRC/python/sglang/srt/entrypoints/http_server.py"
 TOK="$SGLANG_SRC/python/sglang/srt/managers/tokenizer_manager.py"
 SCHED="$SGLANG_SRC/python/sglang/srt/managers/schedule_batch.py"
 GEMMA3="$SGLANG_SRC/python/sglang/srt/models/gemma3_mm.py"
+WEIGHTS_MIXIN="$SGLANG_SRC/python/sglang/srt/managers/scheduler_update_weights_mixin.py"
 
 # ─── http_server.py: skip FastAPI auto-parse for /generate ─────────────────
 
@@ -283,6 +284,51 @@ print(f"  patched {f}")
 PY
 }
 
+# ─── scheduler_update_weights_mixin.py: use gloo for miles group ──────────
+#
+# Root cause: NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice when
+# the SGLang scheduler subprocess (GPU 4/5) calls dist.init_process_group
+# for the miles weight-update group (world_size=3, first-ever NCCL comm on
+# those GPUs). The bundled static libcudart 12.9 calls cuLibraryLoadData to
+# JIT-load CUDA 12.9 PTX kernels → crash against the 12.8 driver.
+# Fix: intercept dist.init_process_group and redirect backend='nccl',
+# world_size=3 → backend='gloo'. Gloo handles CUDA tensors via CPU copies.
+
+_patch_miles_gloo () {
+    local f="$1"
+    python3 - "$f" <<'PY'
+import sys
+from pathlib import Path
+
+GUARD = "miles_gloo_v1"
+f = Path(sys.argv[1])
+s = f.read_text()
+
+if GUARD in s:
+    print(f"  {f} already has {GUARD}, skipping")
+    sys.exit(0)
+
+PATCH = """\
+# === NLA: miles weight-update group gloo patch (miles_gloo_v1) ===
+# Redirect the miles weight-update group (world_size=3) from nccl to gloo.
+# NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
+# scheduler subprocess (first NCCL init on GPU 4/5 hits cuLibraryLoadData
+# against CUDA 12.8 driver). Gloo handles CUDA tensors via CPU copies.
+import torch.distributed as _nla_miles_td
+_nla_miles_orig_ipg = _nla_miles_td.init_process_group
+def _nla_miles_gloo_ipg(backend=None, *args, **kwargs):
+    if str(backend) == 'nccl' and kwargs.get('world_size', 0) == 3:
+        print('[sglang miles_gloo] nccl world_size=3 -> gloo (CUDA 12.8/12.9 fix)', flush=True)
+        backend = 'gloo'
+    return _nla_miles_orig_ipg(backend, *args, **kwargs)
+_nla_miles_td.init_process_group = _nla_miles_gloo_ipg
+# === end miles gloo patch (miles_gloo_v1) ===
+"""
+f.write_text(PATCH + s)
+print(f"  patched {f}")
+PY
+}
+
 # ─── orchestrate ───────────────────────────────────────────────────────────
 
 echo "=== applying NLA SGLang patches to $SGLANG_SRC ==="
@@ -333,6 +379,16 @@ else
     echo "  gemma3_mm.py not present in this sglang version, skipping"
 fi
 
+if [ -f "$WEIGHTS_MIXIN" ]; then
+    if grep -q "miles_gloo_v1" "$WEIGHTS_MIXIN"; then
+        echo "  scheduler_update_weights_mixin.py already patched, skipping"
+    else
+        _patch_miles_gloo "$WEIGHTS_MIXIN"
+    fi
+else
+    echo "  scheduler_update_weights_mixin.py not present in this sglang version, skipping"
+fi
+
 echo "=== verifying ==="
 grep -q "_GEN_REQ_FIELDS" "$HTTP"                          && echo "  ok http_server.py"
 grep -q "input_embeds_b64_bf16" "$HTTP"                    && echo "  ok http_server.py (b64)"
@@ -341,4 +397,5 @@ grep -q "np\.concatenate.*for e in input_embeds" "$SCHED"  && echo "  ok schedul
 grep -q "Upstream PR #14110" "$SCHED"                      && echo "  ok schedule_batch.py (retract)"
 grep -q "Slice to match chunked-prefill" "$SCHED"          && echo "  ok schedule_batch.py (chunked-prefill)"
 [ ! -f "$GEMMA3" ] || grep -q "NLA: input_embeds bypass" "$GEMMA3" && echo "  ok gemma3_mm.py"
+[ ! -f "$WEIGHTS_MIXIN" ] || grep -q "miles_gloo_v1" "$WEIGHTS_MIXIN" && echo "  ok scheduler_update_weights_mixin.py"
 echo "=== done ==="
