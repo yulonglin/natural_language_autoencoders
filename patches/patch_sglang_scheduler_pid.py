@@ -31,8 +31,9 @@ from pathlib import Path
 
 TARGET_FILE = (sys.argv[1] if len(sys.argv) > 1
                else "/root/sglang/python/sglang/srt/managers/scheduler.py")
-GUARD = "modal_fork_bad_fork_v6"
+GUARD = "modal_fork_bad_fork_v7"
 OLD_GUARDS = [
+    "modal_fork_bad_fork_v6",
     "modal_fork_bad_fork_v5",
     "modal_fork_bad_fork_v4",
     "modal_fork_bad_fork_v3",
@@ -89,49 +90,71 @@ while pos < len(code) and code[pos] != '\n':
     pos += 1
 pos += 1  # skip the newline — now at first char of function body
 
-# The RESET block: glob-based libcuda discovery + LD_LIBRARY_PATH fix + fork guards.
-# Outer string is NOT an f-string; {_var} are literal brace pairs for the inserted code.
+# The RESET block: broad libcuda search + LD_LIBRARY_PATH fix + fork guards.
+# v7: DON'T import torch.cuda here — it triggers the sticky 803 error before we
+# can do anything. Instead access it via sys.modules ONLY if already loaded.
+# Also broadened the search beyond nvidia/lib64 to match sitecustomize v5.
 RESET = (
-    f"    # {GUARD}: fix LD_LIBRARY_PATH + glob-based host driver preload.\n"
-    "    import os as _os, ctypes as _ctypes, glob as _glob\n"
-    "    _nvidia_lib64 = '/usr/local/nvidia/lib64'\n"
-    "    _compat_path  = '/usr/local/cuda/compat'\n"
+    f"    # {GUARD}: fix LD_LIBRARY_PATH + broad host driver search.\n"
+    "    import os as _os, ctypes as _ctypes, glob as _glob, sys as _sys\n"
+    "    _compat_path = '/usr/local/cuda/compat'\n"
     "    _ld_orig = _os.environ.get('LD_LIBRARY_PATH', '')\n"
     "    _parts = [p for p in _ld_orig.split(':') if p and p != _compat_path]\n"
-    "    if _nvidia_lib64 in _parts:\n"
-    "        _parts.remove(_nvidia_lib64)\n"
-    "    _parts.insert(0, _nvidia_lib64)\n"
     "    _ld_fixed = ':'.join(_parts)\n"
     "    _os.environ['LD_LIBRARY_PATH'] = _ld_fixed\n"
-    "    print(f'[sched_v6 pid={_os.getpid()}]"
+    "    print(f'[sched_v7 pid={_os.getpid()}]"
     " LD_LIBRARY_PATH: {_ld_orig!r} -> {_ld_fixed!r}', flush=True)\n"
-    "    print(f'[sched_v6 pid={_os.getpid()}]"
+    "    print(f'[sched_v7 pid={_os.getpid()}]"
     " CUDA_VISIBLE_DEVICES={_os.environ.get(\"CUDA_VISIBLE_DEVICES\")!r}', flush=True)\n"
-    "    # Glob for versioned libcuda.so.* (libcuda.so.1 symlink may not exist).\n"
-    "    _candidates = sorted(_glob.glob(_nvidia_lib64 + '/libcuda.so*'))\n"
-    "    _real = [f for f in _candidates if _os.path.isfile(f)]\n"
-    "    _host_libcuda = _real[0] if _real else None\n"
+    "    # Broad search: nvidia/lib64 may be empty on Modal; try many paths.\n"
+    "    _SEARCH_PATHS = [\n"
+    "        '/usr/local/nvidia/lib64', '/usr/local/nvidia/lib',\n"
+    "        '/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib', '/usr/local/lib',\n"
+    "    ] + [p for p in _parts if p]\n"
+    "    _host_libcuda = None\n"
+    "    for _sdir in _SEARCH_PATHS:\n"
+    "        _cands = sorted(_glob.glob(_sdir + '/libcuda.so*'))\n"
+    "        _real = [f for f in _cands if _os.path.isfile(f) and _compat_path not in f]\n"
+    "        if _real:\n"
+    "            _host_libcuda = _real[-1]\n"
+    "            print(f'[sched_v7] found host libcuda in {_sdir!r}: {_real}', flush=True)\n"
+    "            break\n"
+    "    if not _host_libcuda:\n"
+    "        print(f'[sched_v7] no host libcuda found in any search path', flush=True)\n"
+    "        # Diagnostic: list /usr/local/nvidia/ recursively\n"
+    "        try:\n"
+    "            _nv_files = []\n"
+    "            for _r, _d, _fs in _os.walk('/usr/local/nvidia'):\n"
+    "                for _fn in _fs:\n"
+    "                    _nv_files.append(_os.path.join(_r, _fn))\n"
+    "                if len(_nv_files) > 30: break\n"
+    "            print(f'[sched_v7] /usr/local/nvidia files: {_nv_files[:30]}', flush=True)\n"
+    "        except Exception as _e:\n"
+    "            print(f'[sched_v7] walk /usr/local/nvidia failed: {_e}', flush=True)\n"
     "    if _host_libcuda:\n"
     "        try:\n"
     "            _lib = _ctypes.CDLL(_host_libcuda)\n"
     "            _lib.cuInit.restype = _ctypes.c_int\n"
     "            _ret = _lib.cuInit(0)\n"
-    "            print(f'[sched_v6] cuInit(0) via {_host_libcuda} = {_ret}', flush=True)\n"
+    "            print(f'[sched_v7] cuInit(0) via {_host_libcuda} = {_ret}', flush=True)\n"
     "            _preload = _os.environ.get('LD_PRELOAD', '')\n"
     "            if _host_libcuda not in _preload:\n"
     "                _os.environ['LD_PRELOAD'] = (_host_libcuda +"
     " (':' + _preload if _preload else ''))\n"
     "        except OSError as _e:\n"
-    "            print(f'[sched_v6] CDLL({_host_libcuda!r}) failed: {_e}', flush=True)\n"
+    "            print(f'[sched_v7] CDLL({_host_libcuda!r}) failed: {_e}', flush=True)\n"
+    "    # Only bypass torch.cuda fork-guard if torch.cuda is ALREADY in sys.modules.\n"
+    "    # Do NOT import it here — that triggers the sticky 803 before libcuda is fixed.\n"
+    "    _tc = _sys.modules.get('torch.cuda')\n"
+    "    if _tc is not None:\n"
+    "        _tc._is_in_bad_fork = lambda: False\n"
+    "        _tc._initialized = True\n"
+    "        print(f'[sched_v7] bypassed torch.cuda fork guards', flush=True)\n"
     "    else:\n"
-    "        _all_files = _os.listdir(_nvidia_lib64) if _os.path.isdir(_nvidia_lib64) else []\n"
-    "        print(f'[sched_v6] no libcuda.so* in {_nvidia_lib64!r}; listing: {_all_files[:30]}', flush=True)\n"
-    "    import torch.cuda as _torch_cuda\n"
-    "    _torch_cuda._is_in_bad_fork = lambda: False\n"
-    "    _torch_cuda._initialized = True\n"
-    "    del _os, _ctypes, _glob, _nvidia_lib64, _compat_path, _ld_orig, _parts, _ld_fixed,"
-    " _candidates, _real, _host_libcuda\n"
+    "        print(f'[sched_v7] torch.cuda not yet imported; fork guards skipped', flush=True)\n"
+    "    del _os, _ctypes, _glob, _sys, _compat_path, _ld_orig, _parts, _ld_fixed,"
+    " _SEARCH_PATHS, _host_libcuda, _tc\n"
 )
 
 f.write_text(code[:pos] + RESET + code[pos:])
-print(f"[{GUARD}] patched {TARGET_FILE}: glob-based libcuda preload + fork CUDA guard bypass")
+print(f"[{GUARD}] patched {TARGET_FILE}: broad libcuda search + no torch.cuda import")
