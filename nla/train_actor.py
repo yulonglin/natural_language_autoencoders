@@ -56,6 +56,49 @@ from nla.storage import _load_storage, is_remote
 
 CRITIC_ONLY_MM_KEYS = {MM_CRITIC_TOKENS_KEY}
 
+# Zero-valid-rollouts handling. A step where every rollout on a rank failed
+# <explanation> extraction yields n_min == 0. We SKIP that step (return None
+# from _truncate_to_cross_rank_min, gated on the post-all_reduce min so the
+# decision is identical on every rank — no NCCL desync) rather than crash.
+# But we page loudly: a hard zero from a TRAINED checkpoint usually means a
+# broken injection path (grep generated text for CJK), not a transient.
+_EMPTY_ROLLOUT_PINGED = False
+_CONSECUTIVE_EMPTY_STEPS = 0
+
+
+def _note_empty_rollout(where: str) -> None:
+    """Warn every time, page once (NLA_PINGME_CMD), optionally crash after
+    NLA_MAX_EMPTY_STEPS consecutive empties (default: never crash — skip)."""
+    global _EMPTY_ROLLOUT_PINGED, _CONSECUTIVE_EMPTY_STEPS
+    _CONSECUTIVE_EMPTY_STEPS += 1
+    msg = (
+        f"[NLA] zero valid rollouts at {where} "
+        f"(consecutive={_CONSECUTIVE_EMPTY_STEPS}) — skipping this step. Likely "
+        f"injection failure (grep generated text for CJK) or actor not emitting "
+        f"<explanation> tags. Set NLA_ROLLOUT_TEXT_DUMP to capture rollout text."
+    )
+    print(msg, flush=True)
+    if not _EMPTY_ROLLOUT_PINGED:
+        _EMPTY_ROLLOUT_PINGED = True
+        cmd = os.environ.get("NLA_PINGME_CMD")
+        if cmd:
+            subprocess.Popen(
+                [cmd, msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+    max_empty = os.environ.get("NLA_MAX_EMPTY_STEPS")
+    if max_empty and _CONSECUTIVE_EMPTY_STEPS >= int(max_empty):
+        raise RuntimeError(
+            f"{_CONSECUTIVE_EMPTY_STEPS} consecutive zero-valid-rollout steps "
+            f">= NLA_MAX_EMPTY_STEPS={max_empty} — setup is broken, not transient."
+        )
+
+
+def _reset_empty_rollout_counter() -> None:
+    """Call on any step with valid rollouts so the consecutive-empty counter
+    only trips on a *run* of empties, not cumulative across a healthy run."""
+    global _CONSECUTIVE_EMPTY_STEPS
+    _CONSECUTIVE_EMPTY_STEPS = 0
+
 
 def _swap_rollout_to_critic_tokens(rollout_data: dict, device: torch.device) -> dict:
     """Rewire rollout_data: actor tokens → critic tokens, filter failed extractions.
@@ -160,8 +203,13 @@ def _assert_reward_train_paths_agree(
 
 def _truncate_to_cross_rank_min(
     rollout_data: dict, dp_group, micro_batch_size: int | None
-) -> dict:
+) -> dict | None:
     """All-reduce len(tokens) to the cross-rank MIN and truncate all lists.
+
+    Returns None when the cross-rank min is 0 (a rank had no valid
+    <explanation> extractions) — the caller must skip the step. The decision
+    is gated on the post-all_reduce value, identical on every rank, so the
+    skip is lockstep-safe (no FSDP grad-allreduce desync / hang).
 
     After _swap_rollout_to_critic_tokens, each rank may have a different
     len(kept). get_data_iterator computes num_steps = len(tokens) // (gbs/dp);
@@ -175,11 +223,10 @@ def _truncate_to_cross_rank_min(
     n_min = n.item()
     if micro_batch_size is not None:
         n_min = (n_min // micro_batch_size) * micro_batch_size
-    assert n_min > 0, (
-        f"cross-rank min(len(kept)) rounded to {n_min} — at least one rank has "
-        f"no valid <explanation> extractions. Actor is not emitting tags "
-        f"reliably. Raise rollout_batch_size or check actor SFT checkpoint."
-    )
+    if n_min == 0:
+        _note_empty_rollout("critic _truncate_to_cross_rank_min")
+        return None
+    _reset_empty_rollout_counter()
     out = {k: v[:n_min] for k, v in rollout_data.items()}
     out["dynamic_global_batch_size"] = n_min * dist.get_world_size(dp_group)
     return out
@@ -973,6 +1020,9 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 self.parallel_state.dp_group,
                 None if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
             )
+            if rollout_data is None:
+                self._nla_vectors = None  # mirror end-of-body cleanup; skip step
+                return
         elif not self._is_critic_model:
             # LM-actor: strip variable-length critic tokens (would flow to
             # model(**kwargs) as unknown kwarg after multimodal concat).
@@ -998,10 +1048,11 @@ class NLAFSDPActor(FSDPTrainRayActor):
             dist.all_reduce(n_local, op=dist.ReduceOp.MIN, group=self.parallel_state.dp_group)
             micro = self.args.micro_batch_size
             n_aligned = (n_local.item() // micro) * micro
-            assert n_aligned > 0, (
-                f"actor has {n_local.item()} samples after cross-rank MIN, "
-                f"fewer than micro_batch_size={micro}. Raise rollout_batch_size."
-            )
+            if n_aligned == 0:
+                _note_empty_rollout("actor cross-rank MIN")
+                self._nla_vectors = None
+                return
+            _reset_empty_rollout_counter()
             n_orig = len(rollout_data.get("tokens", []))
             for k, v in list(rollout_data.items()):
                 if isinstance(v, list) and len(v) == n_orig:
