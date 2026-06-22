@@ -79,9 +79,15 @@ def _prep_batch(samples: list[Sample]):
     for the subset with valid extractions; FAILED ones get the fixed penalty."""
     dump_path = os.environ.get("NLA_ROLLOUT_TEXT_DUMP")
     if dump_path:
-        with open(dump_path, "w") as f:
+        with open(dump_path, "a") as f:  # append: keep ALL batches, not just last
+            n_ok = sum(extract_explanation(s.response) is not None for s in samples)
+            f.write(f"=== batch: {n_ok}/{len(samples)} extracted ===\n")
             for i, s in enumerate(samples[:20]):
-                f.write(f"=== sample {i} (status={s.status.name}) ===\n{s.response}\n\n")
+                ok = extract_explanation(s.response) is not None
+                f.write(
+                    f"--- sample {i} status={s.status.name} extracted={ok} ---\n"
+                    f"{s.response}\n\n"
+                )
     prompts, golds, orig_idx = [], [], []
     for i, s in enumerate(samples):
         # Only COMPLETED samples go through the critic. FAILED covers both
@@ -99,6 +105,11 @@ def _prep_batch(samples: list[Sample]):
             golds.append(s.metadata["activation_vector"])
             orig_idx.append(i)
     if not prompts:
+        print(
+            f"[NLA] reward batch: 0/{len(samples)} samples had a valid "
+            f"<explanation> extraction (all FAILED/TRUNCATED)",
+            flush=True,
+        )
         return None, []
     # add_special_tokens=True matches stage0 extractor (extractors.py:131).
     # Gemma needs BOS here; Qwen has bos_token=None (no-op). See sft_critic.py.
