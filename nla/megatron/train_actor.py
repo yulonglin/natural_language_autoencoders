@@ -708,6 +708,9 @@ class NLAMegatronActor(MegatronTrainRayActor):
             self.parallel_state.dp_group,
             None if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
         )
+        if rollout_data is None:
+            self._nla_vectors_slot[0] = None  # mirror end-of-body cleanup; skip step
+            return
         # Parent's train_actor reads self._actor_critic_groups when use_critic —
         # our connect_actor_critic is a no-op so the attr doesn't exist.
         saved_use_critic = self.args.use_critic
@@ -730,6 +733,8 @@ class NLAMegatronActor(MegatronTrainRayActor):
                 self.parallel_state.dp_group,
                 None if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
             )
+            if rollout_data is None:
+                return  # no vector slot to clear on the critic path; skip step
 
         data_iterator, num_microbatches = get_data_iterator(
             self.args, self.model, self.parallel_state, rollout_data
