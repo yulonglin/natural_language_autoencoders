@@ -148,17 +148,24 @@ def _assert_reward_train_paths_agree(
     ~1.5-2.0 here. bf16 GEMM tiling noise is ~1e-4.
     """
     mm_list = rollout_data["multimodal_train_inputs"]
-    toks = [mm[MM_CRITIC_TOKENS_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm]
-    golds = torch.cat([mm[MM_ACTIVATION_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm], dim=0)
+    valid = [mm for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm]
+    # This n<4 guard MUST precede the torch.cat below. When every rollout on the
+    # rank failed <explanation> extraction (n == 0), torch.cat([]) raises
+    # "expected a non-empty list" BEFORE we ever reach the skip. A small/empty
+    # batch can't exercise varied-length padding anyway, so skip the diagnostic;
+    # the genuine empty-rollout condition is handled + paged downstream by
+    # _truncate_to_cross_rank_min (see _note_empty_rollout).
+    if len(valid) < 4:
+        print(f"[NLA STEP0 CHECK] skipped: n={len(valid)} < 4 (batch too small / no valid extractions)", flush=True)
+        return
+    toks = [mm[MM_CRITIC_TOKENS_KEY] for mm in valid]
+    golds = torch.cat([mm[MM_ACTIVATION_KEY] for mm in valid], dim=0)
     # Two paths must agree on ANY subset — a handful of varied-length samples
     # exercises padding edge cases; 32 from the rank-partition adds ~1s.
     # critic_fwd returns .cpu() but rollout_data's golds are on the rank's
     # CUDA device (miles moved them during data prep). Unify on CPU.
     toks, golds = toks[:32], golds[:32].float().cpu()
     n = len(toks)
-    if n < 4:
-        print(f"[NLA STEP0 CHECK] skipped: n={n} < 4 (smoke-test batch too small for varied-length padding)", flush=True)
-        return
 
     # Reward path: pad to max, attention_mask, critic_fwd picks last_idx.
     lens = torch.tensor([t.shape[0] for t in toks])

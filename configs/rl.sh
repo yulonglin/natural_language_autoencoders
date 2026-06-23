@@ -105,13 +105,18 @@ ${PYTHON:-python} train.py \
     --critic-num-nodes "$CRITIC_NODES" \
     --critic-num-gpus-per-node "$CRITIC_GPUS" \
     --rollout-num-gpus "$ROLLOUT_GPUS" \
-    --rollout-max-response-len 150 \
-    --rollout-max-context-len 300 \
+    `# Response/context caps. Defaults (150/300) reproduce the Qwen2.5-7B-Instruct` \
+    `# run (no <think> block — emits <explanation> directly). REASONING models` \
+    `# (e.g. DeepSeek-R1-Distill) emit a long <think> CoT first and need a much` \
+    `# larger response cap, or every rollout truncates inside <think> before` \
+    `# <explanation> → 0 valid extractions → degenerate reward. Override via env.` \
+    --rollout-max-response-len "${RL_MAX_RESPONSE_LEN:-150}" \
+    --rollout-max-context-len "${RL_MAX_CONTEXT_LEN:-300}" \
     `# REQUIRED for NLA — radix cache keys on token IDs, but we inject raw activation` \
     `# vectors at the marker token. Cache would hit across DIFFERENT activations that` \
     `# share the same marker token → silent wrong output. DO NOT REMOVE to "optimize".` \
     --sglang-disable-radix-cache \
-    --sglang-context-length 300 \
+    --sglang-context-length "${SGLANG_CONTEXT_LENGTH:-300}" \
     `# Pre-set device='cuda' so ServerArgs.__post_init__ never calls get_device()` \
     `# in the SGLangEngine Ray actor, which has CUDA Error 803 (NCCL/FSDP-poisoned` \
     `# context). launch_server_process already uses spawn so the subprocess gets a` \
