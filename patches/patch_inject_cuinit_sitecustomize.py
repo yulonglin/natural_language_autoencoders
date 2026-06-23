@@ -29,8 +29,9 @@ import sys
 from pathlib import Path
 
 GUARD = "cuinit_sitecustomize_v5"
+MODULE_NAME = "_nla_cuinit_v5"  # unique import name; loaded once per process via sys.modules cache
 
-SITECUSTOMIZE_CONTENT = f'''\
+MODULE_CONTENT = f'''\
 # injected by patch_inject_cuinit_sitecustomize.py ({GUARD})
 # Fix LD_LIBRARY_PATH + preload host CUDA driver before any Python imports.
 import os as _os, ctypes as _ctypes, glob as _glob, subprocess as _sp
@@ -120,31 +121,39 @@ del _os, _ctypes, _glob, _sp, _compat_path, _pid, _ld_orig, _parts, _ld_fixed
 del _SEARCH_PATHS, _host_libcuda
 '''
 
-# Find the site-packages directory for the current Python
+# Find the site-packages directory for the current Python.
 import site
 candidates = site.getsitepackages() if hasattr(site, "getsitepackages") else []
 candidates.append(
     f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 )
 
-target = None
-for sp in candidates:
-    p = Path(sp)
-    if p.is_dir():
-        target = p / "sitecustomize.py"
-        break
-
-if target is None:
+sp_dir = next((Path(sp) for sp in candidates if Path(sp).is_dir()), None)
+if sp_dir is None:
     print("Could not find site-packages, skipping")
     sys.exit(0)
 
-if target.exists():
-    existing = target.read_text()
-    if GUARD in existing:
-        print(f"sitecustomize.py already has {GUARD} injection at {target}")
-        sys.exit(0)
-    target.write_text(SITECUSTOMIZE_CONTENT)
-    print(f"replaced sitecustomize.py with {GUARD} at {target} (was: {len(existing)} chars)")
-else:
-    target.write_text(SITECUSTOMIZE_CONTENT)
-    print(f"wrote {GUARD} to {target}")
+# Delivery: a `.pth` import-hook + a `sitecustomize.py` shim, both importing one
+# uniquely-named module. Two delivery mechanisms because the winner differs by env:
+#   - Docker base-Python: `sitecustomize` import wins (site-packages is first on sys.path).
+#   - uv venv: the base stdlib dir precedes the venv site-packages, so a `sitecustomize.py`
+#     dropped here is SHADOWED by the system one. `site` executes `import`-lines in EVERY
+#     `.pth` across all site dirs regardless of ordering, so the `.pth` fires there.
+# Python caches the module in sys.modules, so it runs exactly once per process no matter
+# how many mechanisms fire — but re-runs in each fork (803 is per-process sticky, so we WANT
+# the fork-chain'd sglang scheduler subprocess to re-prime its own driver).
+module_path = sp_dir / f"{MODULE_NAME}.py"
+pth_path = sp_dir / f"{MODULE_NAME}.pth"   # sorts after most deps; runs before user imports
+site_shim = sp_dir / "sitecustomize.py"
+
+if module_path.exists() and GUARD in module_path.read_text():
+    print(f"{MODULE_NAME}.py already has {GUARD} injection at {module_path}")
+    sys.exit(0)
+
+module_path.write_text(MODULE_CONTENT)
+pth_path.write_text(f"import {MODULE_NAME}\n")
+site_shim.write_text(
+    f"# shim injected by patch_inject_cuinit_sitecustomize.py ({GUARD})\n"
+    f"import {MODULE_NAME}  # noqa: F401\n"
+)
+print(f"wrote {GUARD}: module={module_path}, pth={pth_path}, sitecustomize-shim={site_shim}")
