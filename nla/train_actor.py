@@ -10,6 +10,7 @@ early-returns when log_probs/values are None, _train_step override handles .valu
 Override _train_core (not train) so parent handles get_rollout_data + timers + perf log.
 """
 
+import logging
 import multiprocessing
 import os
 import threading
@@ -332,6 +333,15 @@ class NLAFSDPActor(FSDPTrainRayActor):
                     f"HF weights from --critic-load, ignoring the DCP overlay you asked for."
                 )
             args.load = args.critic_load_dcp or args.critic_load
+            if args.critic_load and not args.critic_load_dcp:
+                logging.getLogger(__name__).warning(
+                    "--critic-load provided without --critic-load-dcp. "
+                    "Critic will resume with COLD Adam + bf16 weight round-trip "
+                    "(no optimizer state preserved). "
+                    "Pass --critic-load-dcp <run>/critic (the dir with "
+                    "latest_checkpointed_iteration.txt) to preserve Adam moments "
+                    "and avoid ~260 re-warmup steps per resume."
+                )
             args.save = args.critic_save
             args.lr = args.critic_lr or args.lr
             # Megatron wires this at megatron_utils/actor.py:93; FSDP doesn't.
