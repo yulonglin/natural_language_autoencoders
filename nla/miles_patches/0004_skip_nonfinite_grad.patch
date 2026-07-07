@@ -15,6 +15,8 @@ self.optimizer.zero_grad() of the next step clears the poisoned gradient.
 Threshold from env NLA_GRAD_SKIP_THRESHOLD (default 1000; healthy grad_norm is
 ~4, step-0 transient ~118, explosions 1e4+). Healthy batches step normally.
 
+diff --git a/miles/backends/fsdp_utils/actor.py b/miles/backends/fsdp_utils/actor.py
+index 3498392d6..64b396a6d 100644
 --- a/miles/backends/fsdp_utils/actor.py
 +++ b/miles/backends/fsdp_utils/actor.py
 @@ -1,4 +1,5 @@
@@ -23,10 +25,10 @@ Threshold from env NLA_GRAD_SKIP_THRESHOLD (default 1000; healthy grad_norm is
  import os
  import random
  from argparse import Namespace
-@@ -471,8 +489,24 @@ class FSDPTrainRayActor(TrainRayActor):
+@@ -488,8 +489,23 @@ class FSDPTrainRayActor(TrainRayActor):
                  grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                  grad_norm = grad_norm.full_tensor().item()
-
+ 
 -                self.optimizer.step()
 -                self.lr_scheduler.step()
 +                # [NLA patch 0004] skip the optimizer step when the global
@@ -46,5 +48,6 @@ Threshold from env NLA_GRAD_SKIP_THRESHOLD (default 1000; healthy grad_norm is
 +                        f"[NLA patch 0004] skip optimizer step rollout={rollout_id} "
 +                        f"step={step_id}: grad_norm={grad_norm} (thresh={_grad_skip_thresh})"
 +                    )
-
+ 
                  if self.args.ci_test:
+                     check_grad_norm(
