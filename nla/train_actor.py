@@ -10,11 +10,17 @@ early-returns when log_probs/values are None, _train_step override handles .valu
 Override _train_core (not train) so parent handles get_rollout_data + timers + perf log.
 """
 
+import multiprocessing
 import os
 import threading
 import shutil
 import subprocess
 import sys
+
+# Force spawn so SGLang's server subprocess gets a clean CUDA context.
+# fork-after-CUDA-init (the training ranks touch CUDA before the rollout
+# server forks) causes CUDA Error 803 in the child.
+multiprocessing.set_start_method("spawn", force=True)
 
 import ray
 
@@ -543,6 +549,40 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # nothing to sync.
         pass
 
+    def set_rollout_manager(self, rollout_manager):
+        # UpdateWeightFromDistributed.connect_rollout_engines() creates an NCCL
+        # group spanning actor rank 0 and the SGLang scheduler subprocesses.
+        # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
+        # side (first NCCL comm on GPU 4/5; cuLibraryLoadData fails against CUDA
+        # 12.8 driver). Fix: redirect all new NCCL PG creation to gloo during
+        # this scope. Safe: mesh_dp/critic PGs are fully set up before this call.
+        # SGLang side is also patched via apply_sglang_patches.sh.
+        _orig_td_ipg = dist.init_process_group
+        _patch_miles = False
+        _orig_miles_ipg = None
+        try:
+            import miles.utils.distributed_utils as _miles_du
+            _orig_miles_ipg = _miles_du.init_process_group
+            _patch_miles = True
+        except (ImportError, AttributeError):
+            pass
+
+        def _gloo_for_miles_pg(backend=None, *args, **kwargs):
+            if str(backend) == 'nccl':
+                print('[actor set_rollout_manager] nccl -> gloo (CUDA 12.8/12.9 fix)', flush=True)
+                backend = 'gloo'
+            return _orig_td_ipg(backend, *args, **kwargs)
+
+        dist.init_process_group = _gloo_for_miles_pg
+        if _patch_miles:
+            _miles_du.init_process_group = _gloo_for_miles_pg
+        try:
+            super().set_rollout_manager(rollout_manager)
+        finally:
+            dist.init_process_group = _orig_td_ipg
+            if _patch_miles:
+                _miles_du.init_process_group = _orig_miles_ipg
+
     def update_weights(self):
         """Sync actor weights to SGLang, then dump embedding for nla_generate.
 
@@ -551,7 +591,26 @@ class NLAFSDPActor(FSDPTrainRayActor):
         before rollout starts, this is the moment to dump a fresh copy.
         nla_generate._maybe_reload_embed reads it.
         """
-        super().update_weights()
+        # Fix NCCL mesh_dp SeqNum deadlock in Miles' UpdateWeight.update_weights():
+        # All 4 actor ranks submit async all-gathers (redistribute(async_op=True))
+        # for each bucket, then call update_bucket_weights(). Only rank 0 actually
+        # sends to SGLang; ranks 1-3 return immediately, race ahead, and submit the
+        # next bucket's all-gathers before rank 0 has submitted them. NCCL detects
+        # the SeqNum mismatch and fires the 600s watchdog. Fix: barrier after each
+        # bucket flush so all 4 ranks advance to the next bucket together.
+        from miles.backends.fsdp_utils.update_weight_utils import UpdateWeight
+
+        _orig_wait_and_update = UpdateWeight.wait_and_update_bucket_weights
+
+        def _synced_wait_and_update(wu_self, bucket):
+            _orig_wait_and_update(wu_self, bucket)
+            dist.barrier()
+
+        UpdateWeight.wait_and_update_bucket_weights = _synced_wait_and_update
+        try:
+            super().update_weights()
+        finally:
+            UpdateWeight.wait_and_update_bucket_weights = _orig_wait_and_update
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).
@@ -704,13 +763,40 @@ class NLAFSDPActor(FSDPTrainRayActor):
     def _train_step(self, batch, step_id, num_microbatches):
         if self._is_critic_model:
             model_args = self._get_model_inputs_args(batch)
+            # NLA_FWD_HOOKS: localize the bf16 forward NaN (ISSUES-LOG O1/O3).
+            # Registers forward hooks on every submodule; reports the first module
+            # whose output goes non-finite while its input was finite — i.e. the op
+            # that births the NaN. Gated + step-bounded → inert on production runs.
+            _fwdhook = bool(os.environ.get("NLA_FWD_HOOKS")) and step_id < 3
+            _fwd_handles = self._nla_register_fwd_hooks(step_id) if _fwdhook else None
             out = self.model(**model_args)
+            if _fwdhook:
+                self._nla_report_fwd_hooks(step_id, _fwd_handles)
             batch["_nla_backbone_last_hidden"] = out.backbone_last_hidden.detach().squeeze(0)
             values = out.values.float()
+            # NLA_CRITIC_DEBUG: localize the multi-GPU MSE NaN (ISSUES-LOG O1/O3).
+            # Prints per-rank finiteness/absmax for forward (h, values), the
+            # loss->values backward grad, the loss, and post-backward param grads
+            # at step 0-2. Gated + step-bounded → inert on production runs.
+            _dbg = bool(os.environ.get("NLA_CRITIC_DEBUG")) and step_id < 3
+            if _dbg:
+                self._nla_debug_forward(step_id, out, values)
             loss, _, log_dict = loss_function(
                 self.args, self.parallel_state, batch, num_microbatches, values,
             )
-            loss.backward()
+            if _dbg:
+                self._nla_debug_loss(step_id, loss)
+            # NLA_DETECT_ANOMALY: localize the op whose backward first produces a
+            # non-finite grad. set_detect_anomaly is expensive, so gate it behind
+            # its own flag + the same step_id<3 bound and crash (after logging the
+            # autograd RuntimeError + forward-op traceback) so we capture the signal.
+            _anomaly = bool(os.environ.get("NLA_DETECT_ANOMALY")) and step_id < 3
+            if _anomaly:
+                self._nla_anomaly_backward(step_id, loss)
+            else:
+                loss.backward()
+            if _dbg:
+                self._nla_debug_grads(step_id)
             return log_dict
         log_dict = super()._train_step(batch, step_id, num_microbatches)
         # FSDP2 overlaps this microbatch's reduce-scatter with the next
@@ -727,6 +813,149 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # recompute; this is the boundary between microbatches).
         torch.cuda.synchronize()
         return log_dict
+
+    # --- NLA multi-GPU NaN diagnostics (env-gated; see _train_step) ----------
+    @staticmethod
+    def _nla_rank():
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def _nla_debug_forward(self, step_id, out, values):
+        rank = self._nla_rank()
+
+        def stat(name, t):
+            tf = t.detach().float()
+            print(f"[NLADBG r{rank} s{step_id}] {name} "
+                  f"finite={bool(torch.isfinite(tf).all())} "
+                  f"absmax={tf.abs().max().item():.4e} shape={tuple(t.shape)}",
+                  flush=True)
+
+        stat("h", out.backbone_last_hidden)
+        stat("values", out.values)
+
+        def _hook(g):
+            gf = g.detach().float()
+            print(f"[NLADBG r{rank} s{step_id}] dL/dvalues "
+                  f"finite={bool(torch.isfinite(gf).all())} "
+                  f"absmax={gf.abs().max().item():.4e}", flush=True)
+
+        values.register_hook(_hook)
+
+    def _nla_debug_loss(self, step_id, loss):
+        rank = self._nla_rank()
+        lf = loss.detach().float()
+        print(f"[NLADBG r{rank} s{step_id}] loss={lf.item():.6e} "
+              f"finite={bool(torch.isfinite(lf).all())}", flush=True)
+
+    def _nla_debug_grads(self, step_id):
+        rank = self._nla_rank()
+        n_nonfinite = 0
+        worst = 0.0
+        for nm, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            gl = g.to_local() if isinstance(g, DTensor) else g
+            glf = gl.detach().float()
+            finite = bool(torch.isfinite(glf).all())
+            m = glf.abs().max().item()
+            if not finite:
+                n_nonfinite += 1
+            if finite and m > worst:
+                worst = m
+            if "value_head" in nm:
+                print(f"[NLADBG r{rank} s{step_id}] grad[{nm}] "
+                      f"finite={finite} absmax={m:.4e}", flush=True)
+        print(f"[NLADBG r{rank} s{step_id}] grads: "
+              f"n_nonfinite_params={n_nonfinite} finite_absmax={worst:.4e}",
+              flush=True)
+
+    @staticmethod
+    def _nla_finite_absmax(obj):
+        """Reduce any tensor / nested tuple|list|dict of tensors to
+        (all_finite, absmax) over floating-point tensors only."""
+        finite, absmax = True, 0.0
+
+        def visit(x):
+            nonlocal finite, absmax
+            if isinstance(x, torch.Tensor) and x.is_floating_point():
+                xf = x.detach().float()
+                finite = finite and bool(torch.isfinite(xf).all())
+                if xf.numel():
+                    absmax = max(absmax, xf.abs().max().item())
+            elif isinstance(x, (tuple, list)):
+                for y in x:
+                    visit(y)
+            elif isinstance(x, dict):
+                for y in x.values():
+                    visit(y)
+
+        visit(obj)
+        return finite, absmax
+
+    def _nla_register_fwd_hooks(self, step_id):
+        """Register forward hooks on ALL submodules (not just leaves: hooks fire
+        in execution order, children before parents, so a container op like SDPA
+        inside self_attn is correctly identified when its leaf q/k/v projections
+        were finite). Records every module emitting non-finite output. Returns
+        handles; caller removes them after the forward."""
+        records = []  # appended in forward-execution order
+
+        def make_hook(name, mod):
+            def hook(_m, inp, out):
+                out_finite, out_absmax = self._nla_finite_absmax(out)
+                if not out_finite:
+                    in_finite, in_absmax = self._nla_finite_absmax(inp)
+                    records.append((name, type(mod).__name__,
+                                    in_finite, in_absmax, out_absmax))
+            return hook
+
+        handles = [mod.register_forward_hook(make_hook(name, mod))
+                   for name, mod in self.model.named_modules()]
+        self._nla_fwd_records = records
+        return handles
+
+    def _nla_report_fwd_hooks(self, step_id, handles):
+        for h in handles:
+            h.remove()
+        rank = self._nla_rank()
+        records = self._nla_fwd_records
+        if not records:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] all module outputs finite",
+                  flush=True)
+            return
+        # Culprit = first module (execution order) with finite input, nonfinite
+        # output. Everything after it is just NaN propagating downstream.
+        culprit = next((r for r in records if r[2]), None)
+        if culprit is not None:
+            name, typ, in_finite, in_absmax, out_absmax = culprit
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] CULPRIT {name} ({typ}) "
+                  f"in_finite={in_finite} in_absmax={in_absmax:.4e} "
+                  f"out_absmax={out_absmax:.4e}", flush=True)
+        else:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}] no finite-in/nonfinite-out "
+                  f"transition found (NaN may enter via inputs)", flush=True)
+        print(f"[NLA_FWDHOOK r{rank} s{step_id}] {len(records)} modules emitted "
+              f"non-finite output; first 6 in execution order:", flush=True)
+        for name, typ, in_finite, in_absmax, out_absmax in records[:6]:
+            print(f"[NLA_FWDHOOK r{rank} s{step_id}]   {name} ({typ}) "
+                  f"in_finite={in_finite} in_absmax={in_absmax:.4e} "
+                  f"out_absmax={out_absmax:.4e}", flush=True)
+
+    def _nla_anomaly_backward(self, step_id, loss):
+        # set_detect_anomaly raises a RuntimeError naming the forward op whose
+        # backward produced the first non-finite grad, plus a second traceback at
+        # the forward call site. Log both (greppable prefix) then re-raise so the
+        # run crashes — the crash IS the signal we want.
+        import traceback
+        rank = self._nla_rank()
+        try:
+            with torch.autograd.set_detect_anomaly(True, check_nan=True):
+                loss.backward()
+        except RuntimeError as e:
+            print(f"[NLA_ANOMALY r{rank} s{step_id}] {e}", flush=True)
+            print(f"[NLA_ANOMALY r{rank} s{step_id}] traceback:\n"
+                  f"{traceback.format_exc()}", flush=True)
+            raise
 
     def critic_fwd(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Inference-only forward, returns values at each sample's last real token.
