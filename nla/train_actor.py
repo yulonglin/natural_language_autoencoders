@@ -1129,6 +1129,33 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 k: (v.to(torch.bfloat16) if isinstance(v, torch.Tensor) else v)
                 for k, v in full_sd.items()
             }
+            # The full-state gather above corrupts value_head.weight (~11k
+            # non-finite, even uint16 lanes; backbone + DCP of the same live
+            # model clean — torch full_state_dict tail-param bug, not
+            # root-caused). Re-gather it directly from the live DTensor.
+            # COLLECTIVE: all ranks reach this (we're outside the rank-0 gate).
+            from torch.distributed.tensor import DTensor
+
+            vh = self.model.value_head.weight
+            vh_full = vh.full_tensor() if isinstance(vh, DTensor) else vh
+            torch.cuda.synchronize()
+            vh_full = vh_full.detach().to("cpu", torch.bfloat16).contiguous()
+            n_bad = (~torch.isfinite(vh_full.float())).sum().item()
+            if n_bad:
+                raise RuntimeError(
+                    f"value_head re-gather via full_tensor(): {n_bad} non-finite "
+                    f"elements — live shards themselves corrupt, not just the gather"
+                )
+            gathered = full_sd.get("value_head.weight")
+            if gathered is not None:
+                bad_gather = (~torch.isfinite(gathered.float())).sum().item()
+                if bad_gather:
+                    print(
+                        f"[NLA] full_state_dict gather corrupted value_head.weight "
+                        f"({bad_gather} non-finite) — replaced with direct full_tensor() re-gather",
+                        flush=True,
+                    )
+            full_sd["value_head.weight"] = vh_full
 
         # Match fsdp_utils/checkpoint.py:199's iter_{rollout_id+1} convention.
         iter_dir = f"{self.args.save}/iter_{rollout_id + 1:07d}"
