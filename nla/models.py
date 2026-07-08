@@ -277,10 +277,17 @@ class NLACriticModel(PreTrainedModel):
         # device_map="auto" → accelerate sharding), but value_head is outside
         # the safetensors index so accelerate doesn't see it. Align to the last
         # layer's placement so forward()'s `h` → value_head doesn't bounce
-        # device/dtype. Skip on meta (FSDP rank≠0 — broadcast handles it).
+        # device/dtype.
+        #
+        # The dtype cast must run on ALL ranks, meta included: FSDP's
+        # to_empty() keeps the meta dtype metadata, so a fp32 leftover on
+        # meta-init ranks yields mixed per-rank shard dtypes and NCCL
+        # full-gather byte-reinterpretation corruption of the gathered
+        # value_head. Device move stays rank-0-only (meta has no device).
+        last = next(inner.layers[-1].parameters())
         if not model.value_head.weight.is_meta:
-            last = next(inner.layers[-1].parameters())
-            model.value_head.to(device=last.device, dtype=last.dtype)
+            model.value_head.to(device=last.device)
+        model.value_head.to(dtype=last.dtype)
 
         return model
 
