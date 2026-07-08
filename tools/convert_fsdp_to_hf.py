@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 import shutil
@@ -190,6 +191,19 @@ def _convert_fsdp_to_hf(
         del hf_model.config.quantization_config
     os.makedirs(output_dir, exist_ok=True)
     hf_model.save_pretrained(output_dir, safe_serialization=True)
+    # Setting hf_model.config.torch_dtype above does not reliably reach the
+    # serialized config: transformers >=4.56 writes the dtype under the new
+    # `dtype` key, which keeps the skeleton's float32. sglang v0.5.6 reads the
+    # legacy `torch_dtype` key and falls back fp32->fp16 when it is absent,
+    # producing Half-activations x Float-params at serve time. Force both keys.
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path) as cf:
+        config_json = json.load(cf)
+    dtype_str = str(tensor_dtype).replace("torch.", "")
+    config_json["dtype"] = dtype_str
+    config_json["torch_dtype"] = dtype_str
+    with open(config_path, "w") as cf:
+        json.dump(config_json, cf, indent=2, sort_keys=True)
     print(f"Model weights saved to {output_dir} (torch_dtype={tensor_dtype})")
 
 
