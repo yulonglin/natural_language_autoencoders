@@ -270,6 +270,67 @@ class _SGLangKeyRemap:
         return {self._prefix + k: v for k, v in self._model.state_dict().items()}
 
 
+def _nla_connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
+    """Copy of miles UpdateWeightFromDistributed.connect_rollout_engines
+    (pin 051cd15) with the weight-update group backend env-configurable
+    (NLA_WEIGHT_UPDATE_BACKEND, default gloo).
+
+    Why: miles hardcodes backend="nccl" at both call sites (the engine RPC
+    payload and the local init_process_group). On this stack the first NCCL
+    collective on that group hangs in comm init: the 2026-07-08 gpt-oss RL
+    smoke sat 10 min inside the first update_weights -- rank 0 finished its
+    bucket all-gathers but the broadcast to sglang never completed, and the
+    server's update POST never finished. Earlier gloo redirects never fired:
+    the sglang-side miles_gloo_v2 meta-path hook lives in a process that
+    never imports miles, and the actor-side set_rollout_manager scope-patch
+    was restored before miles' lazy connect (which happens inside
+    update_weights, fsdp_utils/actor.py:587) could hit it. gloo supports
+    CUDA tensors for broadcast (staged through host) -- slower per sync,
+    but hang-free; the sglang server honors the backend in the request.
+    """
+    import socket
+
+    from miles.utils.distributed_utils import init_process_group
+
+    backend = os.environ.get("NLA_WEIGHT_UPDATE_BACKEND", "gloo")
+    self.rollout_engines = rollout_engines
+    self.rollout_engine_lock = rollout_engine_lock
+
+    # For TP:
+    #   1. AllGather parameters to rank 0
+    #   2. Broadcast parameters from rank 0 to all sglang engines
+    self._is_src_rank = dist.get_rank() == 0
+    if self._is_src_rank:
+        self._group_name = "miles"
+        master_address = ray._private.services.get_node_ip_address()
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master_port = sock.getsockname()[1]
+        world_size = self.args.rollout_num_gpus + 1
+        print(f"[nla] weight-update group backend={backend} "
+              f"(NLA_WEIGHT_UPDATE_BACKEND)", flush=True)
+
+        refs = [
+            engine.init_weights_update_group.remote(
+                master_address,
+                master_port,
+                i * self.args.rollout_num_gpus_per_engine + 1,
+                world_size,
+                self._group_name,
+                backend=backend,
+            )
+            for i, engine in enumerate(self.rollout_engines)
+        ]
+        self._model_update_groups = init_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0,
+            group_name=self._group_name,
+        )
+        ray.get(refs)
+
+
 class NLAFSDPActor(FSDPTrainRayActor):
 
     def init(self, args, role, with_ref=False):
@@ -549,40 +610,6 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # nothing to sync.
         pass
 
-    def set_rollout_manager(self, rollout_manager):
-        # UpdateWeightFromDistributed.connect_rollout_engines() creates an NCCL
-        # group spanning actor rank 0 and the SGLang scheduler subprocesses.
-        # NCCL 2.27.5+cuda12.9 crashes in ncclInitKernelsForDevice on the SGLang
-        # side (first NCCL comm on GPU 4/5; cuLibraryLoadData fails against CUDA
-        # 12.8 driver). Fix: redirect all new NCCL PG creation to gloo during
-        # this scope. Safe: mesh_dp/critic PGs are fully set up before this call.
-        # SGLang side is also patched via apply_sglang_patches.sh.
-        _orig_td_ipg = dist.init_process_group
-        _patch_miles = False
-        _orig_miles_ipg = None
-        try:
-            import miles.utils.distributed_utils as _miles_du
-            _orig_miles_ipg = _miles_du.init_process_group
-            _patch_miles = True
-        except (ImportError, AttributeError):
-            pass
-
-        def _gloo_for_miles_pg(backend=None, *args, **kwargs):
-            if str(backend) == 'nccl':
-                print('[actor set_rollout_manager] nccl -> gloo (CUDA 12.8/12.9 fix)', flush=True)
-                backend = 'gloo'
-            return _orig_td_ipg(backend, *args, **kwargs)
-
-        dist.init_process_group = _gloo_for_miles_pg
-        if _patch_miles:
-            _miles_du.init_process_group = _gloo_for_miles_pg
-        try:
-            super().set_rollout_manager(rollout_manager)
-        finally:
-            dist.init_process_group = _orig_td_ipg
-            if _patch_miles:
-                _miles_du.init_process_group = _orig_miles_ipg
-
     def update_weights(self):
         """Sync actor weights to SGLang, then dump embedding for nla_generate.
 
@@ -598,19 +625,28 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # next bucket's all-gathers before rank 0 has submitted them. NCCL detects
         # the SeqNum mismatch and fires the 600s watchdog. Fix: barrier after each
         # bucket flush so all 4 ranks advance to the next bucket together.
-        from miles.backends.fsdp_utils.update_weight_utils import UpdateWeight
+        from miles.backends.fsdp_utils.update_weight_utils import (
+            UpdateWeight,
+            UpdateWeightFromDistributed,
+        )
 
         _orig_wait_and_update = UpdateWeight.wait_and_update_bucket_weights
+        _orig_connect = UpdateWeightFromDistributed.connect_rollout_engines
 
         def _synced_wait_and_update(wu_self, bucket):
             _orig_wait_and_update(wu_self, bucket)
             dist.barrier()
 
         UpdateWeight.wait_and_update_bucket_weights = _synced_wait_and_update
+        # miles connects rollout engines lazily inside update_weights()
+        # (fsdp_utils/actor.py:587), so this is the scope where the gloo
+        # backend override must be live. See _nla_connect_rollout_engines.
+        UpdateWeightFromDistributed.connect_rollout_engines = _nla_connect_rollout_engines
         try:
             super().update_weights()
         finally:
             UpdateWeight.wait_and_update_bucket_weights = _orig_wait_and_update
+            UpdateWeightFromDistributed.connect_rollout_engines = _orig_connect
         # debug_train_only (SFT mode): no SGLang rollout worker, so nla_generate
         # never runs → no consumer for the dump. Skip — saves ~2.2s/step
         # (FSDP all-gather of 1.1GB embedding + torch.save to disk).

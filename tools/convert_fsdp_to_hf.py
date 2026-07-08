@@ -181,6 +181,13 @@ def _convert_fsdp_to_hf(
     text_cfg = getattr(hf_model.config, "text_config", None)
     if text_cfg is not None:
         text_cfg.torch_dtype = tensor_dtype
+    # DCP tensors are dense (training loads dequantize MXFP4 to bf16 params,
+    # nla/models.py:mxfp4_dequantize_kwargs), but the skeleton config inherits
+    # origin's quantization_config. Writing it into the export would make
+    # sglang treat the bf16 safetensors as MXFP4 and fail to load them.
+    if getattr(hf_model.config, "quantization_config", None) is not None:
+        print("Stripping origin quantization_config from export config (DCP weights are dense).")
+        del hf_model.config.quantization_config
     os.makedirs(output_dir, exist_ok=True)
     hf_model.save_pretrained(output_dir, safe_serialization=True)
     print(f"Model weights saved to {output_dir} (torch_dtype={tensor_dtype})")
@@ -188,8 +195,16 @@ def _convert_fsdp_to_hf(
 
 def copy_assets(origin_hf_dir: str, output_dir: str) -> None:
     if not os.path.isdir(origin_hf_dir):
-        print(f"Skip copy_assets: {origin_hf_dir} is not a local directory (hub ID?). "
-              f"config.json already written by save_pretrained; fetch tokenizer separately if needed.")
+        # Hub ID, not a local dir. The export must still be self-contained --
+        # sglang serves tokenizer from the model path -- so fetch tokenizer
+        # and generation config from the hub instead of copying local files.
+        print(f"copy_assets: {origin_hf_dir} is a hub ID; fetching tokenizer assets from the hub.")
+        from transformers import AutoTokenizer, GenerationConfig
+        AutoTokenizer.from_pretrained(origin_hf_dir, trust_remote_code=True).save_pretrained(output_dir)
+        try:
+            GenerationConfig.from_pretrained(origin_hf_dir).save_pretrained(output_dir)
+        except OSError:
+            print(f"No generation_config on the hub for {origin_hf_dir}; keeping save_pretrained default.")
         return
     # config.json was written by save_pretrained with the correct (possibly text-only)
     # architectures -- copying origin's multimodal config.json would clobber it.
