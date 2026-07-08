@@ -26,6 +26,71 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from nla.arch_adapters import resolve_text_config, resolve_text_model
 
 
+def apply_gptoss_packed_mask_patch() -> None:
+    """Work around transformers 4.57.1 cross-sequence attention leakage on gpt-oss.
+
+    GptOssModel.forward omits position_ids from its create_causal_mask /
+    create_sliding_window_causal_mask kwargs, so masking_utils' packed-sequence
+    detection never fires: with thd packing (attention_mask=None, position_ids
+    reset at boundaries) later segments attend into earlier ones. Measured on
+    the SFT critic: packed preds deviate up to 53% rel-L2 from single-sequence,
+    growing with pack position. Fixed upstream in transformers 5.x.
+
+    Fix: when input looks packed, pre-build the mask dict WITH position_ids
+    (both mask creators accept it and compose packed_sequence_mask_function
+    via and_masks); GptOssModel.forward accepts a prepared dict as
+    attention_mask and skips its own (broken) mask creation.
+    """
+    try:
+        from transformers.models.gpt_oss import modeling_gpt_oss as m
+    except ImportError:
+        return
+    if getattr(m.GptOssModel.forward, "_nla_packed_mask_patch", False):
+        return
+    orig_forward = m.GptOssModel.forward
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, cache_position=None, **kw):
+        if (
+            attention_mask is None
+            and position_ids is not None
+            and past_key_values is None
+            and position_ids.shape[-1] > 1
+            and (torch.diff(position_ids, dim=-1) != 1).any()
+        ):
+            ref = input_ids if input_ids is not None else inputs_embeds
+            B, T, device = ref.shape[0], ref.shape[1], ref.device
+            dtype = inputs_embeds.dtype if inputs_embeds is not None else self.embed_tokens.weight.dtype
+            if cache_position is None:
+                cache_position = torch.arange(T, device=device)
+            # input_embeds is used only for batch/length/dtype/device — a
+            # zero-width dummy avoids materializing real embeddings twice.
+            dummy = torch.empty((B, T, 0), dtype=dtype, device=device)
+            mask_kwargs = dict(
+                config=self.config,
+                input_embeds=dummy,
+                attention_mask=None,
+                cache_position=cache_position,
+                past_key_values=None,
+                position_ids=position_ids,
+            )
+            attention_mask = {
+                "full_attention": m.create_causal_mask(**mask_kwargs),
+                "sliding_attention": m.create_sliding_window_causal_mask(**mask_kwargs),
+            }
+        return orig_forward(
+            self, input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, cache_position=cache_position, **kw,
+        )
+
+    forward._nla_packed_mask_patch = True
+    m.GptOssModel.forward = forward
+
+
+apply_gptoss_packed_mask_patch()
+
+
 # Embedding weight key suffixes across architectures.
 # Llama/Qwen/Mistral/Gemma: model.embed_tokens.weight
 # GPT-2: transformer.wte.weight
