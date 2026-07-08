@@ -241,7 +241,28 @@ class NLACriticModel(PreTrainedModel):
         head_sd = {k.removeprefix("value_head."): v for k, v in state_dict.items() if k.startswith("value_head.")}
 
         self.backbone.save_pretrained(save_directory, state_dict=backbone_sd, **kwargs)
-        save_file(head_sd, str(Path(save_directory) / "value_head.safetensors"))
+        # Guard against silent value_head corruption (seen 2026-07: NaN-riddled
+        # safetensors on disk while the DCP ckpt of the same weights was clean).
+        # Force plain contiguous CPU tensors, refuse to write non-finite
+        # weights, and verify the bytes that actually landed on disk.
+        head_sd = {k: v.detach().to("cpu").contiguous() for k, v in head_sd.items()}
+        for k, v in head_sd.items():
+            bad = (~torch.isfinite(v.float())).sum().item()
+            if bad:
+                raise RuntimeError(
+                    f"value_head export: {bad} non-finite elements in '{k}' BEFORE write "
+                    f"(shape={tuple(v.shape)}, dtype={v.dtype}) — gathered state dict is corrupt"
+                )
+        head_path = Path(save_directory) / "value_head.safetensors"
+        save_file(head_sd, str(head_path))
+        reread = load_file(str(head_path))
+        for k, v in head_sd.items():
+            bad = (~torch.isfinite(reread[k].float())).sum().item()
+            if bad or not torch.equal(reread[k], v):
+                raise RuntimeError(
+                    f"value_head export: readback mismatch for '{k}' "
+                    f"(non_finite={bad}) — save_file wrote corrupt bytes to {head_path}"
+                )
         # config.json written by backbone.save_pretrained includes the truncated num_hidden_layers
 
     def gradient_checkpointing_enable(self, **kwargs):
