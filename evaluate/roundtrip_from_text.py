@@ -48,7 +48,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from nla.config import load_nla_config
 from nla.injection import inject_at_marked_positions
 from nla.models import NLACriticModel
-from nla.schema import extract_explanation, normalize_activation
+from nla.schema import (
+    extract_explanation, load_predict_mean_baselines, normalize_activation,
+)
 
 
 def parse_args():
@@ -69,6 +71,10 @@ def parse_args():
     p.add_argument("--batch-extract", type=int, default=16)
     p.add_argument("--batch-av", type=int, default=16)
     p.add_argument("--batch-ar", type=int, default=32)
+    p.add_argument("--fve-baseline-parquet", default=None,
+                   help="datagen parquet with activation_vector column; when set, also report "
+                        "held-out fve_nrm = 1 - MSE(norm pred, norm gold)/rawvar-baseline, using "
+                        "the sidecar's mse_scale (same definition as train-batch train/fve_nrm)")
     p.add_argument("--extract-device", default="cuda:0")
     p.add_argument("--av-device", default="cuda:1")
     p.add_argument("--ar-device", default="cuda:2")
@@ -197,14 +203,27 @@ def main():
           f"min={cos.min():.4f}", flush=True)
     print(f"(unit-vector mse equivalent 2(1-cos): {2*(1-cos.mean()):.4f})", flush=True)
 
-    pq.write_table(
-        pa.table({
-            "content": pa.array(rows, type=pa.string()),
-            "explanation": pa.array(explanations, type=pa.string()),
-            "cosine_similarity": pa.array(cos.astype(np.float64)),
-        }),
-        args.out,
-    )
+    cols = {
+        "content": pa.array(rows, type=pa.string()),
+        "explanation": pa.array(explanations, type=pa.string()),
+        "cosine_similarity": pa.array(cos.astype(np.float64)),
+    }
+
+    if args.fve_baseline_parquet:
+        # Same definition as the trainer's train/fve_nrm (loss.py): per-element
+        # MSE between mse_scale-normalized pred and gold, over the rawvar
+        # predict-the-mean baseline computed on the TRAIN distribution.
+        b_mn, b_rv = load_predict_mean_baselines(args.fve_baseline_parquet, cfg.mse_scale)
+        p_n = normalize_activation(preds, cfg.mse_scale)
+        a_n = normalize_activation(acts, cfg.mse_scale)
+        mse_nrm = ((p_n - a_n) ** 2).mean(dim=1).numpy()
+        print(f"held-out fve_nrm        = {1.0 - mse_nrm.mean() / b_rv:.4f} "
+              f"(rawvar baseline {b_rv:.4f}, mse_scale={cfg.mse_scale})", flush=True)
+        print(f"held-out fve_nrm_meannorm = {1.0 - mse_nrm.mean() / b_mn:.4f} "
+              f"(meannorm baseline {b_mn:.4f})", flush=True)
+        cols["mse_nrm"] = pa.array(mse_nrm.astype(np.float64))
+
+    pq.write_table(pa.table(cols), args.out)
     print(f"wrote {args.out}", flush=True)
 
 
