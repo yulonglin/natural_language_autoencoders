@@ -20,11 +20,17 @@ dependencies = [
     "pyarrow",
     "datasets",
     "anthropic",
+    "openai",
+    "pydantic",
+    "pydantic-settings",
 ]
 # NOT pip-installable here — install separately per docs/setup.md:
 #   miles    : git clone radixark/miles, build_conda.sh, then git apply nla/miles_patches/*.patch
 #   sglang   : pip install "sglang[all]>=0.5.6", then bash patches/apply_sglang_patches.sh /path/to/sglang
 #   megatron : optional, only for the Megatron backend (70B+)
+
+[dependency-groups]
+dev = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/kitft/natural_language_autoencoders"

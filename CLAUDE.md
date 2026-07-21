@@ -4,8 +4,10 @@
 
 - **This is an open-source repo.** Only standard libs: `pathlib.Path`,
   `pyarrow`, `transformers`, `datasets`, `httpx`, `pyyaml`, `numpy`, `orjson`,
-  `safetensors`, the public `anthropic` SDK, and whatever Miles/SGLang pull in.
-  No private/internal dependencies.
+  `safetensors`, the public `anthropic` and `openai` SDKs, and whatever
+  Miles/SGLang pull in. No private/internal dependencies. (`openai` added
+  2026-07-21 for the `evaluate/proxy_metrics` judge — structured Responses API
+  output via `client.responses.parse`.)
 - **Miles is upstream, not ours.** Don't edit the installed `miles` package —
   extend via subclassing (`NLAFSDPActor`) and the `--*-path` function-pointer
   args. The upstream patches we depend on live as `.patch` files in
