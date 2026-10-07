@@ -105,17 +105,19 @@ def _assert_reward_train_paths_agree(
     ~1.5-2.0 here. bf16 GEMM tiling noise is ~1e-4.
     """
     mm_list = rollout_data["multimodal_train_inputs"]
-    toks = [mm[MM_CRITIC_TOKENS_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm]
-    golds = torch.cat([mm[MM_ACTIVATION_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm], dim=0)
+    mm_ok = [mm for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm]
+    toks = [mm[MM_CRITIC_TOKENS_KEY] for mm in mm_ok][:32]
+    n = len(toks)
+    # Guard BEFORE torch.cat — at step 0 ALL rollouts can fail format (no
+    # <explanation> tags yet) → mm_ok empty → torch.cat([]) ValueError.
+    if n < 4:
+        print(f"[NLA STEP0 CHECK] skipped: n={n} < 4 (too few valid extractions — expected when the actor is not yet emitting tags, or smoke-test batch too small)", flush=True)
+        return
     # Two paths must agree on ANY subset — a handful of varied-length samples
     # exercises padding edge cases; 32 from the rank-partition adds ~1s.
     # critic_fwd returns .cpu() but rollout_data's golds are on the rank's
     # CUDA device (miles moved them during data prep). Unify on CPU.
-    toks, golds = toks[:32], golds[:32].float().cpu()
-    n = len(toks)
-    if n < 4:
-        print(f"[NLA STEP0 CHECK] skipped: n={n} < 4 (smoke-test batch too small for varied-length padding)", flush=True)
-        return
+    golds = torch.cat([mm[MM_ACTIVATION_KEY] for mm in mm_ok], dim=0)[:32].float().cpu()
 
     # Reward path: pad to max, attention_mask, critic_fwd picks last_idx.
     lens = torch.tensor([t.shape[0] for t in toks])
@@ -175,11 +177,18 @@ def _truncate_to_cross_rank_min(
     n_min = n.item()
     if micro_batch_size is not None:
         n_min = (n_min // micro_batch_size) * micro_batch_size
-    assert n_min > 0, (
-        f"cross-rank min(len(kept)) rounded to {n_min} — at least one rank has "
-        f"no valid <explanation> extractions. Actor is not emitting tags "
-        f"reliably. Raise rollout_batch_size or check actor SFT checkpoint."
-    )
+    if n_min <= 0:
+        # Skip instead of assert: at step 0 the actor may emit no valid
+        # <explanation> tags at all (all-format-fail is expected before any
+        # RL update). The all_reduce already ran, so every rank sees the
+        # same n_min → all ranks skip together, rank-symmetric.
+        print(
+            f"[NLA] skipping critic train step: cross-rank min(len(kept)) rounded to {n_min} — "
+            f"at least one rank has no valid <explanation> extractions (expected at step 0). "
+            f"Raise rollout_batch_size if this persists past early steps.",
+            flush=True,
+        )
+        return None
     out = {k: v[:n_min] for k, v in rollout_data.items()}
     out["dynamic_global_batch_size"] = n_min * dist.get_world_size(dp_group)
     return out
@@ -973,6 +982,12 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 self.parallel_state.dp_group,
                 None if self.args.use_dynamic_batch_size else self.args.micro_batch_size,
             )
+            if rollout_data is None:
+                # All-format-fail step (expected at step 0): every critic DP
+                # rank saw the same all-reduced n_min, so all skip together —
+                # no collective enters super()._train_core, no desync.
+                self._nla_vectors = None
+                return
         elif not self._is_critic_model:
             # LM-actor: strip variable-length critic tokens (would flow to
             # model(**kwargs) as unknown kwarg after multimodal concat).

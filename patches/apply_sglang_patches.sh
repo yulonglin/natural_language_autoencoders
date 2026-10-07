@@ -24,6 +24,12 @@ TOK="$SGLANG_SRC/python/sglang/srt/managers/tokenizer_manager.py"
 SCHED="$SGLANG_SRC/python/sglang/srt/managers/schedule_batch.py"
 GEMMA3="$SGLANG_SRC/python/sglang/srt/models/gemma3_mm.py"
 WEIGHTS_MIXIN="$SGLANG_SRC/python/sglang/srt/managers/scheduler_update_weights_mixin.py"
+COMMON="$SGLANG_SRC/python/sglang/srt/utils/common.py"
+
+# Miles lives in a separate checkout (default /root/miles in the Modal build,
+# installed editable before this script runs). Override via NLA_MILES_ROOT.
+MILES_SRC="${NLA_MILES_ROOT:-/root/miles}"
+MILES_DIST="$MILES_SRC/miles/utils/distributed_utils.py"
 
 # ─── http_server.py: skip FastAPI auto-parse for /generate ─────────────────
 
@@ -417,6 +423,101 @@ print(f"  patched {f} (miles_gloo_v2 at line {insert_idx})")
 PY
 }
 
+# ─── common.py: coerce SGLang engine-side weight-update group to gloo ───────
+# The miles_gloo_v2 patch only rewrites init_process_group in the *miles*
+# modules (training side). The SGLang *inference* engine builds its own
+# weight-update group via model_runner.init_weights_update_group ->
+# sglang.srt.utils.common.init_custom_process_group(backend=recv_req.backend),
+# where recv_req.backend is caller-supplied and defaults to "nccl". That group
+# is never touched by miles_gloo_v2, so the first weight broadcast over it hits
+# ncclInitKernelsForDevice and SIGSEGVs (NCCL 2.27.5+cuda12.9 JIT-compiles PTX
+# kernels against the 12.8 driver). Coercing nccl -> gloo here makes the
+# inference side agree with the (already-gloo) training side. Escape hatch:
+# NLA_FORCE_GLOO=0 restores nccl without a rebuild.
+_patch_sglang_gloo () {
+    local f="$1"
+    python3 - "$f" <<'PY'
+import sys
+from pathlib import Path
+
+GUARD = "sglang_gloo_v1"
+f = Path(sys.argv[1])
+s = f.read_text()
+
+if GUARD in s:
+    print(f"  {f} already has {GUARD}, skipping")
+    sys.exit(0)
+
+ANCHOR = "    if backend:\n        backend = Backend(backend)\n"
+n = s.count(ANCHOR)
+assert n == 1, f"expected exactly 1 init_custom_process_group backend anchor, found {n}"
+
+COERCE = (
+    "    # === NLA: sglang_gloo_v1 — coerce nccl -> gloo for weight-update groups ===\n"
+    "    import os as _nla_os\n"
+    '    if str(backend) == "nccl" and _nla_os.environ.get("NLA_FORCE_GLOO", "1") == "1":\n'
+    "        print("
+    '"[sglang sglang_gloo_v1] init_custom_process_group nccl -> gloo (CUDA 12.8/12.9 fix)", '
+    "flush=True)\n"
+    '        backend = "gloo"\n'
+    "    # === end sglang_gloo_v1 ===\n"
+)
+
+s = s.replace(ANCHOR, COERCE + ANCHOR, 1)
+f.write_text(s)
+print(f"  patched {f} (sglang_gloo_v1)")
+PY
+}
+
+# ─── miles distributed_utils.py: coerce the actor-side weight-update group ──
+# The FSDP actor (NLAFSDPActor, a separate Ray process from the SGLang engine)
+# builds ITS side of the "miles" weight-update group via
+# update_weight_utils.connect_rollout_engines ->
+#   init_process_group(backend="nccl", ..., group_name="miles")
+# The engine side is coerced nccl->gloo by sglang_gloo_v1 (common.py). The
+# engine-only meta_path finder (_patch_miles_gloo / miles_gloo_v2) never
+# installs in the actor process, so without this the actor stays nccl (cuda)
+# while the engine is gloo (cpu) -> mismatched rendezvous keys
+# (/miles/miles//cpu//0/0 vs a cuda key) -> 30-min weight-sync deadlock.
+# Patching the SOURCE of init_process_group runs in BOTH processes. Gated on
+# group_name=="miles" so ONLY the weight-update group is touched, never the
+# FSDP/DP GPU collectives. Escape hatch: NLA_FORCE_GLOO=0.
+_patch_miles_dist_gloo () {
+    local f="$1"
+    python3 - "$f" <<'PY'
+import sys
+from pathlib import Path
+
+GUARD = "miles_dist_gloo_v1"
+f = Path(sys.argv[1])
+s = f.read_text()
+
+if GUARD in s:
+    print(f"  {f} already has {GUARD}, skipping")
+    sys.exit(0)
+
+ANCHOR = "    if backend:\n        backend = Backend(backend)\n"
+n = s.count(ANCHOR)
+assert n == 1, f"expected exactly 1 init_process_group backend anchor, found {n}"
+
+COERCE = (
+    "    # === NLA: miles_dist_gloo_v1 — coerce nccl -> gloo for the 'miles' weight-update group ===\n"
+    "    import os as _nla_os\n"
+    '    if str(backend) == "nccl" and group_name == "miles" '
+    'and _nla_os.environ.get("NLA_FORCE_GLOO", "1") == "1":\n'
+    "        print("
+    '"[miles distributed_utils miles_dist_gloo_v1] init_process_group nccl -> gloo (CUDA 12.8/12.9 fix)", '
+    "flush=True)\n"
+    '        backend = "gloo"\n'
+    "    # === end miles_dist_gloo_v1 ===\n"
+)
+
+s = s.replace(ANCHOR, COERCE + ANCHOR, 1)
+f.write_text(s)
+print(f"  patched {f} (miles_dist_gloo_v1)")
+PY
+}
+
 # ─── orchestrate ───────────────────────────────────────────────────────────
 
 echo "=== applying NLA SGLang patches to $SGLANG_SRC ==="
@@ -477,6 +578,26 @@ else
     echo "  scheduler_update_weights_mixin.py not present in this sglang version, skipping"
 fi
 
+if [ -f "$COMMON" ]; then
+    if grep -q "sglang_gloo_v1" "$COMMON"; then
+        echo "  common.py already has sglang_gloo_v1, skipping"
+    else
+        _patch_sglang_gloo "$COMMON"
+    fi
+else
+    echo "  common.py not present in this sglang version, skipping"
+fi
+
+if [ -f "$MILES_DIST" ]; then
+    if grep -q "miles_dist_gloo_v1" "$MILES_DIST"; then
+        echo "  miles distributed_utils.py already has miles_dist_gloo_v1, skipping"
+    else
+        _patch_miles_dist_gloo "$MILES_DIST"
+    fi
+else
+    echo "  miles distributed_utils.py not present (NLA_MILES_ROOT=$MILES_SRC), skipping"
+fi
+
 echo "=== verifying ==="
 grep -q "_GEN_REQ_FIELDS" "$HTTP"                          && echo "  ok http_server.py"
 grep -q "input_embeds_b64_bf16" "$HTTP"                    && echo "  ok http_server.py (b64)"
@@ -486,4 +607,8 @@ grep -q "Upstream PR #14110" "$SCHED"                      && echo "  ok schedul
 grep -q "Slice to match chunked-prefill" "$SCHED"          && echo "  ok schedule_batch.py (chunked-prefill)"
 [ ! -f "$GEMMA3" ] || grep -q "NLA: input_embeds bypass" "$GEMMA3" && echo "  ok gemma3_mm.py"
 [ ! -f "$WEIGHTS_MIXIN" ] || grep -q "miles_gloo_v2" "$WEIGHTS_MIXIN" && echo "  ok scheduler_update_weights_mixin.py"
+# gloo weight-sync markers are load-bearing for RL: fail LOUD if the file exists but the
+# marker is missing, or if the file is absent (path drift) — a silent "ok" masks a deadlock.
+if [ -f "$COMMON" ]; then grep -q "sglang_gloo_v1" "$COMMON" && echo "  ok common.py (sglang_gloo_v1)" || echo "  !! MISSING sglang_gloo_v1 in $COMMON"; else echo "  !! \$COMMON absent ($COMMON) — sglang_gloo_v1 NOT applied"; fi
+if [ -f "$MILES_DIST" ]; then grep -q "miles_dist_gloo_v1" "$MILES_DIST" && echo "  ok miles distributed_utils.py (miles_dist_gloo_v1)" || echo "  !! MISSING miles_dist_gloo_v1 in $MILES_DIST"; else echo "  !! \$MILES_DIST absent ($MILES_DIST) — miles_dist_gloo_v1 NOT applied"; fi
 echo "=== done ==="
